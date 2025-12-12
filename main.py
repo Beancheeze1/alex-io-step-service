@@ -4,8 +4,9 @@
 # Guarantees at least one valid solid is exported.
 #
 # FIX:
-# - Support circular cavities by subtracting cylinders when shape == "circle"
-# - Rectangular cavities remain unchanged
+# - Circle cavities supported (cylindrical cuts)
+# - Coordinate system alignment: editor uses top-left origin (y down),
+#   CAD uses bottom-left origin (y up). Flip Y when placing cavities.
 
 from typing import List, Optional
 import os
@@ -26,7 +27,6 @@ class Cavity(BaseModel):
     x: float = Field(..., ge=0.0, le=1.0)
     y: float = Field(..., ge=0.0, le=1.0)
 
-    # NEW (optional, backwards compatible)
     shape: Optional[str] = None           # "rect" | "circle"
     diameterIn: Optional[float] = None    # for circle cavities
 
@@ -111,26 +111,28 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
         for cav in cavities:
             cav_D = min(cav.depthIn * INCH_TO_MM, T_mm * DEPTH_CLAMP_RATIO)
 
-            left = cav.x * L_mm
-            top = cav.y * W_mm
+            shape = (cav.shape or "rect").lower()
 
             z_top = z_bottom + T_mm
             z_cut = z_top - cav_D
 
-            shape = (cav.shape or "rect").lower()
-
             try:
-                # ----------------------------
-                # CIRCULAR CAVITY
-                # ----------------------------
                 if shape == "circle":
                     dia_in = cav.diameterIn or min(cav.lengthIn, cav.widthIn)
                     dia_mm = dia_in * INCH_TO_MM
                     r_mm = dia_mm / 2.0
 
-                    # keep inside block
-                    cx = max(r_mm, min(L_mm - r_mm, left + r_mm))
-                    cy = max(r_mm, min(W_mm - r_mm, top + r_mm))
+                    # Convert editor top-left normalized coords -> CAD bottom-left coords
+                    x_left = cav.x * L_mm
+                    y_top_svg = cav.y * W_mm
+                    y_top_cad = W_mm * (1.0 - cav.y) - (2.0 * r_mm)
+
+                    # Clamp inside
+                    x_left = max(0.0, min(L_mm - 2.0 * r_mm, x_left))
+                    y_top_cad = max(0.0, min(W_mm - 2.0 * r_mm, y_top_cad))
+
+                    cx = x_left + r_mm
+                    cy = y_top_cad + r_mm
 
                     cavity = (
                         cq.Workplane("XY")
@@ -140,9 +142,6 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
                         .extrude(cav_D)
                     )
 
-                # ----------------------------
-                # RECTANGULAR CAVITY (default)
-                # ----------------------------
                 else:
                     cav_L = cav.lengthIn * INCH_TO_MM
                     cav_W = cav.widthIn * INCH_TO_MM
@@ -150,19 +149,24 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
                     if cav_L >= L_mm or cav_W >= W_mm:
                         continue
 
-                    left = max(0.0, min(L_mm - cav_L, left))
-                    top = max(0.0, min(W_mm - cav_W, top))
+                    x_left = cav.x * L_mm
+                    y_top_svg = cav.y * W_mm
+
+                    # Flip Y: CAD bottom-left origin
+                    y_top_cad = W_mm * (1.0 - cav.y) - cav_W
+
+                    x_left = max(0.0, min(L_mm - cav_L, x_left))
+                    y_top_cad = max(0.0, min(W_mm - cav_W, y_top_cad))
 
                     cavity = (
                         cq.Workplane("XY")
                         .box(cav_L, cav_W, cav_D, centered=(False, False, False))
-                        .translate((left, top, z_cut))
+                        .translate((x_left, y_top_cad, z_cut))
                     )
 
                 cut_result = working.cut(cavity)
                 if cut_result.val().Solids():
                     working = cut_result
-
             except Exception:
                 continue
 
