@@ -77,6 +77,16 @@ class StepRequest(BaseModel):
 
 app = FastAPI(title="Alex-IO STEP microservice")
 
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "alex-io-step-service"}
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "status": "healthy"}
+
+
+
 
 def build_cad_from_layout(layout: Layout) -> cq.Workplane:
     """Build a CadQuery solid from the foam layout."""
