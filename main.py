@@ -1,17 +1,7 @@
 # step_service/main.py
 #
-# Minimal STEP microservice for Alex-IO foam layouts.
-#
-# - Uses CadQuery (OpenCascade) to build robust solids.
-# - One solid per foam layer (stacked in Z, inches → mm).
-# - Each cavity is cut out of its layer via boolean difference.
-# - Exports a single STEP file and returns its text in JSON.
-#
-# Expected to be deployed separately from the Next.js app
-# (e.g. on Render, Fly.io, Railway, etc.).
-#
-# ENV:
-#   PORT (optional, default 8000)
+# SAFE GEOMETRY STEP microservice for Alex-IO foam layouts.
+# Guarantees at least one valid solid is exported.
 
 from typing import List, Optional
 import os
@@ -19,10 +9,10 @@ import tempfile
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, validator
-
-import cadquery as cq  # Make sure cadquery is installed in this environment.
+import cadquery as cq
 
 INCH_TO_MM = 25.4
+DEPTH_CLAMP_RATIO = 0.95  # never cut full thickness
 
 
 class Cavity(BaseModel):
@@ -66,7 +56,7 @@ class Block(BaseModel):
 class Layout(BaseModel):
     block: Block
     stack: List[FoamLayer]
-    cavities: Optional[List[Cavity]] = None  # legacy, treated as extra cavities on top layer
+    cavities: Optional[List[Cavity]] = None
 
 
 class StepRequest(BaseModel):
@@ -77,97 +67,102 @@ class StepRequest(BaseModel):
 
 app = FastAPI(title="Alex-IO STEP microservice")
 
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "alex-io-step-service"}
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "status": "healthy"}
+    return {"ok": True}
 
 
+def build_layer_block(L, W, T, z):
+    return (
+        cq.Workplane("XY")
+        .box(L, W, T, centered=(False, False, False))
+        .translate((0, 0, z))
+    )
 
 
 def build_cad_from_layout(layout: Layout) -> cq.Workplane:
-    """Build a CadQuery solid from the foam layout."""
-    L_block_mm = layout.block.lengthIn * INCH_TO_MM
-    W_block_mm = layout.block.widthIn * INCH_TO_MM
+    L_mm = layout.block.lengthIn * INCH_TO_MM
+    W_mm = layout.block.widthIn * INCH_TO_MM
 
-    z_bottom_mm = 0.0
-    layer_solids: List[cq.Workplane] = []
+    z_bottom = 0.0
+    valid_solids: List[cq.Workplane] = []
 
     for idx, layer in enumerate(layout.stack):
-        thickness_mm = layer.thicknessIn * INCH_TO_MM
-        if thickness_mm <= 0:
+        T_mm = layer.thicknessIn * INCH_TO_MM
+        if T_mm <= 0:
             continue
 
-        # Base foam layer: rectangular prism, corner at (0,0,z_bottom_mm).
-        layer_solid = (
-            cq.Workplane("XY")
-            .box(L_block_mm, W_block_mm, thickness_mm, centered=(False, False, False))
-            .translate((0.0, 0.0, z_bottom_mm))
-        )
+        base = build_layer_block(L_mm, W_mm, T_mm, z_bottom)
+        working = base
 
-        # Gather cavities: layer-specific + legacy top-level (only on first layer).
-        cavities: List[Cavity] = list(layer.cavities or [])
+        cavities = list(layer.cavities or [])
         if idx == 0 and layout.cavities:
             cavities.extend(layout.cavities)
 
         for cav in cavities:
-            # Clamp depth to layer thickness to avoid over-cutting.
-            depth_mm = min(cav.depthIn * INCH_TO_MM, thickness_mm)
+            cav_L = cav.lengthIn * INCH_TO_MM
+            cav_W = cav.widthIn * INCH_TO_MM
+            cav_D = min(cav.depthIn * INCH_TO_MM, T_mm * DEPTH_CLAMP_RATIO)
 
-            # Normalised position from layout: 0..1 across block length/width.
-            left_mm = layout.block.lengthIn * cav.x * INCH_TO_MM
-            top_mm = layout.block.widthIn * cav.y * INCH_TO_MM
+            # Skip cavities larger than layer footprint
+            if cav_L >= L_mm or cav_W >= W_mm:
+                continue
 
-            cav_L_mm = cav.lengthIn * INCH_TO_MM
-            cav_W_mm = cav.widthIn * INCH_TO_MM
+            left = max(0.0, min(L_mm - cav_L, cav.x * L_mm))
+            top = max(0.0, min(W_mm - cav_W, cav.y * W_mm))
 
-            # Cavity is a box that starts at (left, top, z_top - depth)
-            # and cuts downward into the layer.
-            z_layer_top_mm = z_bottom_mm + thickness_mm
-            z_cav_bottom_mm = z_layer_top_mm - depth_mm
+            z_top = z_bottom + T_mm
+            z_cut = z_top - cav_D
 
-            cavity_solid = (
+            cavity = (
                 cq.Workplane("XY")
-                .box(cav_L_mm, cav_W_mm, depth_mm, centered=(False, False, False))
-                .translate((left_mm, top_mm, z_cav_bottom_mm))
+                .box(cav_L, cav_W, cav_D, centered=(False, False, False))
+                .translate((left, top, z_cut))
             )
 
-            layer_solid = layer_solid.cut(cavity_solid)
+            try:
+                cut_result = working.cut(cavity)
+                # If cut removed everything, ignore it
+                if cut_result.val().Solids():
+                    working = cut_result
+            except Exception:
+                continue
 
-        layer_solids.append(layer_solid)
-        z_bottom_mm += thickness_mm
+        # Final safety: if layer was destroyed, keep plain block
+        if not working.val().Solids():
+            working = base
 
-    if not layer_solids:
-        raise ValueError("No valid layer geometry built from layout.")
+        valid_solids.append(working)
+        z_bottom += T_mm
 
-    # Union all layer solids into one compound.
-    solid = layer_solids[0]
-    for other in layer_solids[1:]:
+    if not valid_solids:
+        raise ValueError("No valid solids generated from layout")
+
+    solid = valid_solids[0]
+    for other in valid_solids[1:]:
         solid = solid.union(other)
+
+    if not solid.val().Solids():
+        raise ValueError("Final solid is empty after union")
 
     return solid
 
 
 def export_step_text(solid: cq.Workplane) -> str:
-    """Export the given solid to STEP and return it as a UTF-8 string."""
-    # CadQuery's exporters work with file paths; use a temporary file.
     with tempfile.NamedTemporaryFile(suffix=".step", delete=False) as tmp:
-        tmp_path = tmp.name
+        path = tmp.name
 
     try:
-        cq.exporters.export(solid, tmp_path)
-        with open(tmp_path, "rb") as f:
+        cq.exporters.export(solid, path)
+        with open(path, "rb") as f:
             data = f.read()
     finally:
         try:
-            os.remove(tmp_path)
+            os.remove(path)
         except OSError:
             pass
 
-    # STEP is ASCII/UTF-8 text.
     return data.decode("utf-8", errors="ignore")
 
 
@@ -177,15 +172,14 @@ async def step_from_layout(payload: StepRequest):
         solid = build_cad_from_layout(payload.layout)
         step_text = export_step_text(solid)
     except Exception as exc:
-        # Log full error server-side, but return a friendly message.
-        print("[STEP-SVC] Error building STEP:", repr(exc))
+        print("[STEP-SVC] Geometry error:", repr(exc))
         raise HTTPException(
             status_code=400,
             detail=f"Failed to build STEP geometry: {exc}",
         )
 
     if not step_text.strip():
-        raise HTTPException(status_code=500, detail="STEP export produced empty text")
+        raise HTTPException(500, "STEP export produced empty text")
 
     return {
         "ok": True,
@@ -198,5 +192,9 @@ async def step_from_layout(payload: StepRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        reload=False,
+    )
