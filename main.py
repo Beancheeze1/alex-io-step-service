@@ -2,6 +2,10 @@
 #
 # SAFE GEOMETRY STEP microservice for Alex-IO foam layouts.
 # Guarantees at least one valid solid is exported.
+#
+# FIX:
+# - Support circular cavities by subtracting cylinders when shape == "circle"
+# - Rectangular cavities remain unchanged
 
 from typing import List, Optional
 import os
@@ -21,6 +25,10 @@ class Cavity(BaseModel):
     depthIn: float
     x: float = Field(..., ge=0.0, le=1.0)
     y: float = Field(..., ge=0.0, le=1.0)
+
+    # NEW (optional, backwards compatible)
+    shape: Optional[str] = None           # "rect" | "circle"
+    diameterIn: Optional[float] = None    # for circle cavities
 
     @validator("lengthIn", "widthIn", "depthIn")
     def positive(cls, v: float) -> float:
@@ -101,35 +109,63 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
             cavities.extend(layout.cavities)
 
         for cav in cavities:
-            cav_L = cav.lengthIn * INCH_TO_MM
-            cav_W = cav.widthIn * INCH_TO_MM
             cav_D = min(cav.depthIn * INCH_TO_MM, T_mm * DEPTH_CLAMP_RATIO)
 
-            # Skip cavities larger than layer footprint
-            if cav_L >= L_mm or cav_W >= W_mm:
-                continue
-
-            left = max(0.0, min(L_mm - cav_L, cav.x * L_mm))
-            top = max(0.0, min(W_mm - cav_W, cav.y * W_mm))
+            left = cav.x * L_mm
+            top = cav.y * W_mm
 
             z_top = z_bottom + T_mm
             z_cut = z_top - cav_D
 
-            cavity = (
-                cq.Workplane("XY")
-                .box(cav_L, cav_W, cav_D, centered=(False, False, False))
-                .translate((left, top, z_cut))
-            )
+            shape = (cav.shape or "rect").lower()
 
             try:
+                # ----------------------------
+                # CIRCULAR CAVITY
+                # ----------------------------
+                if shape == "circle":
+                    dia_in = cav.diameterIn or min(cav.lengthIn, cav.widthIn)
+                    dia_mm = dia_in * INCH_TO_MM
+                    r_mm = dia_mm / 2.0
+
+                    # keep inside block
+                    cx = max(r_mm, min(L_mm - r_mm, left + r_mm))
+                    cy = max(r_mm, min(W_mm - r_mm, top + r_mm))
+
+                    cavity = (
+                        cq.Workplane("XY")
+                        .workplane(offset=z_cut)
+                        .center(cx, cy)
+                        .circle(r_mm)
+                        .extrude(cav_D)
+                    )
+
+                # ----------------------------
+                # RECTANGULAR CAVITY (default)
+                # ----------------------------
+                else:
+                    cav_L = cav.lengthIn * INCH_TO_MM
+                    cav_W = cav.widthIn * INCH_TO_MM
+
+                    if cav_L >= L_mm or cav_W >= W_mm:
+                        continue
+
+                    left = max(0.0, min(L_mm - cav_L, left))
+                    top = max(0.0, min(W_mm - cav_W, top))
+
+                    cavity = (
+                        cq.Workplane("XY")
+                        .box(cav_L, cav_W, cav_D, centered=(False, False, False))
+                        .translate((left, top, z_cut))
+                    )
+
                 cut_result = working.cut(cavity)
-                # If cut removed everything, ignore it
                 if cut_result.val().Solids():
                     working = cut_result
+
             except Exception:
                 continue
 
-        # Final safety: if layer was destroyed, keep plain block
         if not working.val().Solids():
             working = base
 
