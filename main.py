@@ -7,6 +7,13 @@
 # - Circle cavities supported (cylindrical cuts)
 # - Coordinate system alignment: editor uses top-left origin (y down),
 #   CAD uses bottom-left origin (y up). Flip Y when placing cavities.
+# - NEW (Path A): Rounded-rect cavities supported via optional corner radius.
+#   If a cavity includes cornerRadiusIn (or corner_radius_in), we generate a
+#   filleted rectangular pocket instead of a sharp-corner box cut.
+#
+# NOTE:
+# - This is geometry-only behavior. No changes to parsing elsewhere.
+# - Square rect + circle behavior unchanged when radius is missing/0.
 
 from typing import List, Optional
 import os
@@ -18,6 +25,8 @@ import cadquery as cq
 
 INCH_TO_MM = 25.4
 DEPTH_CLAMP_RATIO = 0.95  # never cut full thickness
+# Small epsilon to avoid fillet edge-case when radius ~= half the side
+FILLET_EPS_MM = 1e-3
 
 
 class Cavity(BaseModel):
@@ -27,8 +36,13 @@ class Cavity(BaseModel):
     x: float = Field(..., ge=0.0, le=1.0)
     y: float = Field(..., ge=0.0, le=1.0)
 
-    shape: Optional[str] = None           # "rect" | "circle"
+    shape: Optional[str] = None           # "rect" | "circle" | "roundedRect" (optional)
     diameterIn: Optional[float] = None    # for circle cavities
+
+    # NEW (Path A): optional rounded-rect radius (inches)
+    # Accept both snake/camel to be tolerant of upstream naming.
+    cornerRadiusIn: Optional[float] = None
+    corner_radius_in: Optional[float] = None
 
     @validator("lengthIn", "widthIn", "depthIn")
     def positive(cls, v: float) -> float:
@@ -89,6 +103,16 @@ def build_layer_block(L, W, T, z):
     )
 
 
+def _safe_pos(v: Optional[float]) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        n = float(v)
+        return n if n > 0 else None
+    except Exception:
+        return None
+
+
 def build_cad_from_layout(layout: Layout) -> cq.Workplane:
     L_mm = layout.block.lengthIn * INCH_TO_MM
     W_mm = layout.block.widthIn * INCH_TO_MM
@@ -113,6 +137,9 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
 
             shape = (cav.shape or "rect").lower()
 
+            # Support both "roundedrect" and plain "rect" with cornerRadiusIn set.
+            corner_r_in = _safe_pos(cav.cornerRadiusIn) or _safe_pos(cav.corner_radius_in) or None
+
             z_top = z_bottom + T_mm
             z_cut = z_top - cav_D
 
@@ -124,7 +151,6 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
 
                     # Convert editor top-left normalized coords -> CAD bottom-left coords
                     x_left = cav.x * L_mm
-                    y_top_svg = cav.y * W_mm
                     y_top_cad = W_mm * (1.0 - cav.y) - (2.0 * r_mm)
 
                     # Clamp inside
@@ -150,19 +176,41 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
                         continue
 
                     x_left = cav.x * L_mm
-                    y_top_svg = cav.y * W_mm
 
-                    # Flip Y: CAD bottom-left origin
+                    # Flip Y: CAD bottom-left origin (editor uses top-left)
                     y_top_cad = W_mm * (1.0 - cav.y) - cav_W
 
                     x_left = max(0.0, min(L_mm - cav_L, x_left))
                     y_top_cad = max(0.0, min(W_mm - cav_W, y_top_cad))
 
-                    cavity = (
-                        cq.Workplane("XY")
-                        .box(cav_L, cav_W, cav_D, centered=(False, False, False))
-                        .translate((x_left, y_top_cad, z_cut))
-                    )
+                    # Rounded-rect pocket if radius is present and sane
+                    r_mm = 0.0
+                    if corner_r_in is not None and corner_r_in > 0:
+                        r_mm = corner_r_in * INCH_TO_MM
+                        # Clamp to avoid invalid fillet cases
+                        max_r = (min(cav_L, cav_W) / 2.0) - FILLET_EPS_MM
+                        if max_r <= 0:
+                            r_mm = 0.0
+                        else:
+                            r_mm = max(0.0, min(r_mm, max_r))
+
+                    if shape in ("roundedrect", "rounded_rect", "rounded-rect") or r_mm > 0:
+                        # Build a filleted rectangle sketch centered on the cavity area, then extrude.
+                        cx = x_left + (cav_L / 2.0)
+                        cy = y_top_cad + (cav_W / 2.0)
+
+                        wp = cq.Workplane("XY").workplane(offset=z_cut).center(cx, cy).rect(cav_L, cav_W)
+                        if r_mm > 0:
+                            wp = wp.vertices().fillet(r_mm)
+
+                        cavity = wp.extrude(cav_D)
+                    else:
+                        # Square pocket (legacy behavior)
+                        cavity = (
+                            cq.Workplane("XY")
+                            .box(cav_L, cav_W, cav_D, centered=(False, False, False))
+                            .translate((x_left, y_top_cad, z_cut))
+                        )
 
                 cut_result = working.cut(cavity)
                 if cut_result.val().Solids():
