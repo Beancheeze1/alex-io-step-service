@@ -195,15 +195,22 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
                             r_mm = max(0.0, min(r_mm, max_r))
 
                     if shape in ("roundedrect", "rounded_rect", "rounded-rect") or r_mm > 0:
-                        # Build a filleted rectangle sketch centered on the cavity area, then extrude.
+                        # Build the pocket as a 3D solid first, then fillet its vertical edges.
                         cx = x_left + (cav_L / 2.0)
                         cy = y_top_cad + (cav_W / 2.0)
 
-                        wp = cq.Workplane("XY").workplane(offset=z_cut).center(cx, cy).rect(cav_L, cav_W)
-                        if r_mm > 0:
-                            wp = wp.vertices().fillet(r_mm)
+                        cavity = (
+                            cq.Workplane("XY")
+                            .workplane(offset=z_cut)
+                            .center(cx, cy)
+                            .rect(cav_L, cav_W)
+                            .extrude(cav_D)
+                        )
 
-                        cavity = wp.extrude(cav_D)
+                        if r_mm > 0:
+                            # Fillet vertical edges (parallel to Z). This is reliable in CQ.
+                            cavity = cavity.edges("|Z").fillet(r_mm)
+
                     else:
                         # Square pocket (legacy behavior)
                         cavity = (
