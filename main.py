@@ -11,9 +11,11 @@
 #   If a cavity includes cornerRadiusIn (or corner_radius_in), we generate a
 #   filleted rectangular pocket instead of a sharp-corner box cut.
 #
-# NOTE:
-# - This is geometry-only behavior. No changes to parsing elsewhere.
-# - Square rect + circle behavior unchanged when radius is missing/0.
+# LAYER CAVITY FIX (Path A):
+# - Per-layer STEP exports must ONLY use layer.cavities.
+# - Do NOT merge layout.cavities into the first layer.
+#   layout.cavities is a mirror of the active layer in the editor and can
+#   incorrectly stamp cavities onto blank layers when exporting them alone.
 
 from typing import List, Optional
 import os
@@ -128,9 +130,8 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
         base = build_layer_block(L_mm, W_mm, T_mm, z_bottom)
         working = base
 
+        # IMPORTANT: per-layer STEP must only use per-layer cavities.
         cavities = list(layer.cavities or [])
-        if idx == 0 and layout.cavities:
-            cavities.extend(layout.cavities)
 
         for cav in cavities:
             cav_D = min(cav.depthIn * INCH_TO_MM, T_mm * DEPTH_CLAMP_RATIO)
