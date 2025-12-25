@@ -8,7 +8,7 @@
 # - Coordinate system alignment: editor uses top-left origin (y down),
 #   CAD uses bottom-left origin (y up). Flip Y when placing cavities.
 # - NEW (Path A): Rounded-rect cavities supported via optional corner radius.
-#   If a cavity includes cornerRadiusIn (or corner_radius_in), we generate a
+#   If a cavity includes cornerRadiusIn (or snake-case), we generate a
 #   filleted rectangular pocket instead of a sharp-corner box cut.
 #
 # LAYER CAVITY FIX (Path A):
@@ -22,6 +22,10 @@
 #   TWO corners: upper-left and lower-right (matching editor intent).
 # - chamferIn is in inches, default 1" if omitted.
 # - Chamfer is applied to the outer block profile for EVERY layer.
+#
+# PATCH (THIS FIX):
+# - Upstream now sends cornerStyle="chamfer" (and chamferIn) rather than
+#   croppedCorners. Treat cornerStyle="chamfer" as croppedCorners=true.
 
 from typing import List, Optional
 import os
@@ -79,6 +83,11 @@ class Block(BaseModel):
     # NEW (Path A): crop corners (outer block chamfer intent)
     croppedCorners: Optional[bool] = None
     cropped_corners: Optional[bool] = None
+
+    # ALSO ACCEPT upstream "cornerStyle" signal (used by editor/export bundle)
+    cornerStyle: Optional[str] = None       # "square" | "chamfer"
+    corner_style: Optional[str] = None
+
     chamferIn: Optional[float] = None
     chamfer_in: Optional[float] = None
 
@@ -131,9 +140,19 @@ def _truthy_bool(v: Optional[bool]) -> bool:
     return bool(v is True)
 
 
+def _resolve_corner_style(block: Block) -> str:
+    # tolerate both camel + snake; normalize
+    s = (block.cornerStyle or block.corner_style or "").strip().lower()
+    return s
+
+
 def _resolve_cropped(block: Block) -> bool:
-    # tolerate both camel + snake
-    return _truthy_bool(block.croppedCorners) or _truthy_bool(block.cropped_corners)
+    # tolerate both camel + snake boolean
+    if _truthy_bool(block.croppedCorners) or _truthy_bool(block.cropped_corners):
+        return True
+
+    # ALSO: accept cornerStyle="chamfer" as cropped intent (upstream signal)
+    return _resolve_corner_style(block) == "chamfer"
 
 
 def _resolve_chamfer_in(block: Block) -> float:
