@@ -16,6 +16,12 @@
 # - Do NOT merge layout.cavities into the first layer.
 #   layout.cavities is a mirror of the active layer in the editor and can
 #   incorrectly stamp cavities onto blank layers when exporting them alone.
+#
+# NEW (Path A): Cropped-corner block support (chamfered outer perimeter).
+# - If layout.block.croppedCorners is true (or snake-case), we chamfer
+#   TWO corners: upper-left and lower-right (matching editor intent).
+# - chamferIn is in inches, default 1" if omitted.
+# - Chamfer is applied to the outer block profile for EVERY layer.
 
 from typing import List, Optional
 import os
@@ -70,10 +76,24 @@ class Block(BaseModel):
     widthIn: float
     thicknessIn: float
 
+    # NEW (Path A): crop corners (outer block chamfer intent)
+    croppedCorners: Optional[bool] = None
+    cropped_corners: Optional[bool] = None
+    chamferIn: Optional[float] = None
+    chamfer_in: Optional[float] = None
+
     @validator("lengthIn", "widthIn", "thicknessIn")
     def positive(cls, v: float) -> float:
         if v <= 0:
             raise ValueError("Block dimensions must be > 0")
+        return v
+
+    @validator("chamferIn", "chamfer_in")
+    def chamfer_positive(cls, v: Optional[float]) -> Optional[float]:
+        if v is None:
+            return None
+        if v <= 0:
+            raise ValueError("Chamfer must be > 0 when provided")
         return v
 
 
@@ -97,14 +117,6 @@ async def health():
     return {"ok": True}
 
 
-def build_layer_block(L, W, T, z):
-    return (
-        cq.Workplane("XY")
-        .box(L, W, T, centered=(False, False, False))
-        .translate((0, 0, z))
-    )
-
-
 def _safe_pos(v: Optional[float]) -> Optional[float]:
     try:
         if v is None:
@@ -115,9 +127,83 @@ def _safe_pos(v: Optional[float]) -> Optional[float]:
         return None
 
 
+def _truthy_bool(v: Optional[bool]) -> bool:
+    return bool(v is True)
+
+
+def _resolve_cropped(block: Block) -> bool:
+    # tolerate both camel + snake
+    return _truthy_bool(block.croppedCorners) or _truthy_bool(block.cropped_corners)
+
+
+def _resolve_chamfer_in(block: Block) -> float:
+    # inches, default 1"
+    v = _safe_pos(block.chamferIn) or _safe_pos(block.chamfer_in)
+    return float(v) if v is not None else 1.0
+
+
+def build_layer_block(L_mm: float, W_mm: float, T_mm: float, z: float, cropped: bool, chamfer_mm: float):
+    """
+    Build one layer block.
+
+    Default: rectangular prism at origin.
+    If cropped: chamfer TWO corners in the XY profile:
+      - upper-left  (0, W)
+      - lower-right (L, 0)
+
+    Coordinates are CAD bottom-left origin.
+    """
+    if not cropped:
+        return (
+            cq.Workplane("XY")
+            .box(L_mm, W_mm, T_mm, centered=(False, False, False))
+            .translate((0, 0, z))
+        )
+
+    # Clamp chamfer to be valid
+    c = float(chamfer_mm)
+    if not (c > 0):
+        c = 1.0 * INCH_TO_MM
+
+    # Need enough room for a chamfer on both relevant edges
+    # (and to avoid self-intersections)
+    if L_mm <= 2.0 * c or W_mm <= 2.0 * c:
+        return (
+            cq.Workplane("XY")
+            .box(L_mm, W_mm, T_mm, centered=(False, False, False))
+            .translate((0, 0, z))
+        )
+
+    # Polygon with chamfers at:
+    #  - LR corner (L,0) => (L-c,0) -> (L,c)
+    #  - UL corner (0,W) => (0,W-c) -> (c,W)
+    pts = [
+        (0.0, 0.0),
+        (L_mm - c, 0.0),
+        (L_mm, c),
+        (L_mm, W_mm),
+        (0.0, W_mm - c),
+        (c, W_mm),
+    ]
+
+    solid = (
+        cq.Workplane("XY")
+        .polyline(pts)
+        .close()
+        .extrude(T_mm)
+        .translate((0, 0, z))
+    )
+    return solid
+
+
 def build_cad_from_layout(layout: Layout) -> cq.Workplane:
     L_mm = layout.block.lengthIn * INCH_TO_MM
     W_mm = layout.block.widthIn * INCH_TO_MM
+
+    # NEW: crop corner intent
+    cropped = _resolve_cropped(layout.block)
+    chamfer_in = _resolve_chamfer_in(layout.block)
+    chamfer_mm = chamfer_in * INCH_TO_MM
 
     z_bottom = 0.0
     valid_solids: List[cq.Workplane] = []
@@ -127,7 +213,7 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
         if T_mm <= 0:
             continue
 
-        base = build_layer_block(L_mm, W_mm, T_mm, z_bottom)
+        base = build_layer_block(L_mm, W_mm, T_mm, z_bottom, cropped=cropped, chamfer_mm=chamfer_mm)
         working = base
 
         # IMPORTANT: per-layer STEP must only use per-layer cavities.
