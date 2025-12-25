@@ -8,7 +8,7 @@
 # - Coordinate system alignment: editor uses top-left origin (y down),
 #   CAD uses bottom-left origin (y up). Flip Y when placing cavities.
 # - NEW (Path A): Rounded-rect cavities supported via optional corner radius.
-#   If a cavity includes cornerRadiusIn (or snake-case), we generate a
+#   If a cavity includes cornerRadiusIn (or corner_radius_in), we generate a
 #   filleted rectangular pocket instead of a sharp-corner box cut.
 #
 # LAYER CAVITY FIX (Path A):
@@ -23,9 +23,10 @@
 # - chamferIn is in inches, default 1" if omitted.
 # - Chamfer is applied to the outer block profile for EVERY layer.
 #
-# PATCH (THIS FIX):
-# - Upstream now sends cornerStyle="chamfer" (and chamferIn) rather than
-#   croppedCorners. Treat cornerStyle="chamfer" as croppedCorners=true.
+# PATH-A TOLERANCE (2025-12-25):
+# - Also treat block.cornerStyle == "chamfer" (or snake-case) as cropped intent,
+#   because some upstream exporters store chamfer intent via cornerStyle instead
+#   of croppedCorners.
 
 from typing import List, Optional
 import os
@@ -83,13 +84,12 @@ class Block(BaseModel):
     # NEW (Path A): crop corners (outer block chamfer intent)
     croppedCorners: Optional[bool] = None
     cropped_corners: Optional[bool] = None
-
-    # ALSO ACCEPT upstream "cornerStyle" signal (used by editor/export bundle)
-    cornerStyle: Optional[str] = None       # "square" | "chamfer"
-    corner_style: Optional[str] = None
-
     chamferIn: Optional[float] = None
     chamfer_in: Optional[float] = None
+
+    # NEW (Path A): tolerate chamfer intent expressed as cornerStyle
+    cornerStyle: Optional[str] = None
+    corner_style: Optional[str] = None
 
     @validator("lengthIn", "widthIn", "thicknessIn")
     def positive(cls, v: float) -> float:
@@ -140,19 +140,12 @@ def _truthy_bool(v: Optional[bool]) -> bool:
     return bool(v is True)
 
 
-def _resolve_corner_style(block: Block) -> str:
-    # tolerate both camel + snake; normalize
-    s = (block.cornerStyle or block.corner_style or "").strip().lower()
-    return s
-
-
 def _resolve_cropped(block: Block) -> bool:
-    # tolerate both camel + snake boolean
+    # tolerate both camel + snake, plus cornerStyle="chamfer"
     if _truthy_bool(block.croppedCorners) or _truthy_bool(block.cropped_corners):
         return True
-
-    # ALSO: accept cornerStyle="chamfer" as cropped intent (upstream signal)
-    return _resolve_corner_style(block) == "chamfer"
+    style = (block.cornerStyle or block.corner_style or "").strip().lower()
+    return style == "chamfer"
 
 
 def _resolve_chamfer_in(block: Block) -> float:
@@ -196,13 +189,17 @@ def build_layer_block(L_mm: float, W_mm: float, T_mm: float, z: float, cropped: 
     # Polygon with chamfers at:
     #  - LR corner (L,0) => (L-c,0) -> (L,c)
     #  - UL corner (0,W) => (0,W-c) -> (c,W)
+    #
+    # IMPORTANT (FIX):
+    # Point order must preserve the top edge as horizontal (L,W) -> (c,W),
+    # otherwise you get a diagonal "spike" at the top-left.
     pts = [
         (0.0, 0.0),
         (L_mm - c, 0.0),
         (L_mm, c),
         (L_mm, W_mm),
-        (0.0, W_mm - c),
         (c, W_mm),
+        (0.0, W_mm - c),
     ]
 
     solid = (
