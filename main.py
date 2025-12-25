@@ -20,6 +20,8 @@
 # NEW (Path A): Cropped-corner block support (chamfered outer perimeter).
 # - If layout.block.croppedCorners is true (or snake-case), we chamfer
 #   TWO corners: upper-left and lower-right (matching editor intent).
+# - ALSO accept layout.block.cornerStyle == "chamfer" (or snake-case) since
+#   SVG/DXF use cornerStyle+chamferIn. This keeps STEP in sync with exports.ts.
 # - chamferIn is in inches, default 1" if omitted.
 # - Chamfer is applied to the outer block profile for EVERY layer.
 
@@ -79,8 +81,14 @@ class Block(BaseModel):
     # NEW (Path A): crop corners (outer block chamfer intent)
     croppedCorners: Optional[bool] = None
     cropped_corners: Optional[bool] = None
+
+    # Keep chamfer size support (inches)
     chamferIn: Optional[float] = None
     chamfer_in: Optional[float] = None
+
+    # NEW: accept "cornerStyle" to match SVG/DXF export wiring
+    cornerStyle: Optional[str] = None        # "square" | "chamfer"
+    corner_style: Optional[str] = None
 
     @validator("lengthIn", "widthIn", "thicknessIn")
     def positive(cls, v: float) -> float:
@@ -131,9 +139,20 @@ def _truthy_bool(v: Optional[bool]) -> bool:
     return bool(v is True)
 
 
-def _resolve_cropped(block: Block) -> bool:
+def _resolve_corner_style(block: Block) -> str:
     # tolerate both camel + snake
-    return _truthy_bool(block.croppedCorners) or _truthy_bool(block.cropped_corners)
+    s = block.cornerStyle or block.corner_style
+    return str(s).strip().lower() if s is not None else ""
+
+
+def _resolve_cropped(block: Block) -> bool:
+    # tolerate both camel + snake booleans
+    if _truthy_bool(block.croppedCorners) or _truthy_bool(block.cropped_corners):
+        return True
+
+    # ALSO accept cornerStyle="chamfer" (SVG/DXF wiring)
+    corner_style = _resolve_corner_style(block)
+    return corner_style == "chamfer"
 
 
 def _resolve_chamfer_in(block: Block) -> float:
@@ -179,15 +198,14 @@ def build_layer_block(L_mm: float, W_mm: float, T_mm: float, z: float, cropped: 
     #  - UL corner (0,W) => (0,W-c) -> (c,W)
     #
     # IMPORTANT:
-    # Point order must trace the perimeter without a diagonal jump,
-    # otherwise you get a stray triangular "flap" at the UL chamfer.
+    # Point order must trace the perimeter without a diagonal jump.
     pts = [
         (0.0, 0.0),
         (L_mm - c, 0.0),
         (L_mm, c),
         (L_mm, W_mm),
-        (c, W_mm),        # <-- swapped order (was after (0, W-c))
-        (0.0, W_mm - c),  # <-- swapped order (was before (c, W))
+        (c, W_mm),
+        (0.0, W_mm - c),
     ]
 
     solid = (
@@ -204,7 +222,7 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
     L_mm = layout.block.lengthIn * INCH_TO_MM
     W_mm = layout.block.widthIn * INCH_TO_MM
 
-    # NEW: crop corner intent
+    # Crop corner intent
     cropped = _resolve_cropped(layout.block)
     chamfer_in = _resolve_chamfer_in(layout.block)
     chamfer_mm = chamfer_in * INCH_TO_MM
