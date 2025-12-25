@@ -22,11 +22,6 @@
 #   TWO corners: upper-left and lower-right (matching editor intent).
 # - chamferIn is in inches, default 1" if omitted.
 # - Chamfer is applied to the outer block profile for EVERY layer.
-#
-# PATH-A TOLERANCE (2025-12-25):
-# - Also treat block.cornerStyle == "chamfer" (or snake-case) as cropped intent,
-#   because some upstream exporters store chamfer intent via cornerStyle instead
-#   of croppedCorners.
 
 from typing import List, Optional
 import os
@@ -87,10 +82,6 @@ class Block(BaseModel):
     chamferIn: Optional[float] = None
     chamfer_in: Optional[float] = None
 
-    # NEW (Path A): tolerate chamfer intent expressed as cornerStyle
-    cornerStyle: Optional[str] = None
-    corner_style: Optional[str] = None
-
     @validator("lengthIn", "widthIn", "thicknessIn")
     def positive(cls, v: float) -> float:
         if v <= 0:
@@ -141,11 +132,8 @@ def _truthy_bool(v: Optional[bool]) -> bool:
 
 
 def _resolve_cropped(block: Block) -> bool:
-    # tolerate both camel + snake, plus cornerStyle="chamfer"
-    if _truthy_bool(block.croppedCorners) or _truthy_bool(block.cropped_corners):
-        return True
-    style = (block.cornerStyle or block.corner_style or "").strip().lower()
-    return style == "chamfer"
+    # tolerate both camel + snake
+    return _truthy_bool(block.croppedCorners) or _truthy_bool(block.cropped_corners)
 
 
 def _resolve_chamfer_in(block: Block) -> float:
@@ -190,16 +178,16 @@ def build_layer_block(L_mm: float, W_mm: float, T_mm: float, z: float, cropped: 
     #  - LR corner (L,0) => (L-c,0) -> (L,c)
     #  - UL corner (0,W) => (0,W-c) -> (c,W)
     #
-    # IMPORTANT (FIX):
-    # Point order must preserve the top edge as horizontal (L,W) -> (c,W),
-    # otherwise you get a diagonal "spike" at the top-left.
+    # IMPORTANT:
+    # Point order must trace the perimeter without a diagonal jump,
+    # otherwise you get a stray triangular "flap" at the UL chamfer.
     pts = [
         (0.0, 0.0),
         (L_mm - c, 0.0),
         (L_mm, c),
         (L_mm, W_mm),
-        (c, W_mm),
-        (0.0, W_mm - c),
+        (c, W_mm),        # <-- swapped order (was after (0, W-c))
+        (0.0, W_mm - c),  # <-- swapped order (was before (c, W))
     ]
 
     solid = (
