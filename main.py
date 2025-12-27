@@ -17,13 +17,15 @@
 #   layout.cavities is a mirror of the active layer in the editor and can
 #   incorrectly stamp cavities onto blank layers when exporting them alone.
 #
-# NEW (Path A): Cropped-corner block support (chamfered outer perimeter).
-# - If layout.block.croppedCorners is true (or snake-case), we chamfer
-#   TWO corners: upper-left and lower-right (matching editor intent).
-# - ALSO accept layout.block.cornerStyle == "chamfer" (or snake-case) since
-#   SVG/DXF use cornerStyle+chamferIn. This keeps STEP in sync with exports.ts.
+# CROPPED-CORNER BLOCK SUPPORT (Path A):
+# - Outer perimeter chamfer (two corners: upper-left and lower-right).
+# - Accept global intent:
+#     - layout.block.croppedCorners true (or snake-case), OR
+#     - layout.block.cornerStyle == "chamfer" (or snake-case)
+# - NEW (Path A): Per-layer override
+#     - If a layer sets cropCorners true/false (or snake-case), STEP honors it
+#       for THAT layer only. If omitted, we fall back to the global intent.
 # - chamferIn is in inches, default 1" if omitted.
-# - Chamfer is applied to the outer block profile for EVERY layer.
 
 from typing import List, Optional
 import os
@@ -66,6 +68,11 @@ class FoamLayer(BaseModel):
     label: Optional[str] = None
     cavities: Optional[List[Cavity]] = None
 
+    # NEW (Path A): per-layer cropped corner override (optional)
+    # If present, it overrides the global block cropped intent for this layer.
+    cropCorners: Optional[bool] = None
+    crop_corners: Optional[bool] = None
+
     @validator("thicknessIn")
     def positive(cls, v: float) -> float:
         if v <= 0:
@@ -78,7 +85,7 @@ class Block(BaseModel):
     widthIn: float
     thicknessIn: float
 
-    # NEW (Path A): crop corners (outer block chamfer intent)
+    # Global crop-corners intent
     croppedCorners: Optional[bool] = None
     cropped_corners: Optional[bool] = None
 
@@ -86,7 +93,7 @@ class Block(BaseModel):
     chamferIn: Optional[float] = None
     chamfer_in: Optional[float] = None
 
-    # NEW: accept "cornerStyle" to match SVG/DXF export wiring
+    # Accept "cornerStyle" to match SVG/DXF export wiring
     cornerStyle: Optional[str] = None        # "square" | "chamfer"
     corner_style: Optional[str] = None
 
@@ -145,7 +152,7 @@ def _resolve_corner_style(block: Block) -> str:
     return str(s).strip().lower() if s is not None else ""
 
 
-def _resolve_cropped(block: Block) -> bool:
+def _resolve_cropped_global(block: Block) -> bool:
     # tolerate both camel + snake booleans
     if _truthy_bool(block.croppedCorners) or _truthy_bool(block.cropped_corners):
         return True
@@ -153,6 +160,19 @@ def _resolve_cropped(block: Block) -> bool:
     # ALSO accept cornerStyle="chamfer" (SVG/DXF wiring)
     corner_style = _resolve_corner_style(block)
     return corner_style == "chamfer"
+
+
+def _resolve_cropped_for_layer(layer: FoamLayer, cropped_global: bool) -> bool:
+    """
+    Per-layer override:
+      - If layer explicitly sets cropCorners true/false, honor it
+      - If omitted (None), fall back to global intent
+    """
+    if layer.cropCorners is True or layer.crop_corners is True:
+        return True
+    if layer.cropCorners is False or layer.crop_corners is False:
+        return False
+    return bool(cropped_global)
 
 
 def _resolve_chamfer_in(block: Block) -> float:
@@ -222,8 +242,9 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
     L_mm = layout.block.lengthIn * INCH_TO_MM
     W_mm = layout.block.widthIn * INCH_TO_MM
 
-    # Crop corner intent
-    cropped = _resolve_cropped(layout.block)
+    # Global crop corner intent (fallback if layer doesn't specify)
+    cropped_global = _resolve_cropped_global(layout.block)
+
     chamfer_in = _resolve_chamfer_in(layout.block)
     chamfer_mm = chamfer_in * INCH_TO_MM
 
@@ -235,7 +256,14 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
         if T_mm <= 0:
             continue
 
-        base = build_layer_block(L_mm, W_mm, T_mm, z_bottom, cropped=cropped, chamfer_mm=chamfer_mm)
+        # NEW: Per-layer cropped corner resolution
+        cropped_layer = _resolve_cropped_for_layer(layer, cropped_global)
+
+        base = build_layer_block(
+            L_mm, W_mm, T_mm, z_bottom,
+            cropped=cropped_layer,
+            chamfer_mm=chamfer_mm
+        )
         working = base
 
         # IMPORTANT: per-layer STEP must only use per-layer cavities.
