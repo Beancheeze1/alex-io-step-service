@@ -280,7 +280,7 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
 
         # ✅ Path-A: cut order matters for overlapping cavities.
         # Cut shallow first, deep last to preserve stepped pockets.
-       def _eff_depth_mm(c: Cavity) -> float:
+def _eff_depth_mm(c: Cavity) -> float:
     try:
         d_mm = float(c.depthIn) * INCH_TO_MM
     except Exception:
@@ -292,6 +292,7 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
 
     # Blind pocket (legacy behavior)
     return min(d_mm, T_mm * DEPTH_CLAMP_RATIO)
+
 
 
         cavities.sort(key=_eff_depth_mm)
