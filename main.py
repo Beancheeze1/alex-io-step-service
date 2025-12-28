@@ -33,6 +33,10 @@
 #   shallow cavities first, then deeper cavities last.
 # - This does NOT change non-overlapping cavities.
 # - Depth reference remains the layer's top surface (correct).
+#
+# NEW (Path A) - THROUGH CUT:
+# - If a cavity depth is >= layer thickness, cut through the full layer.
+# - Implemented by setting cut depth to T_mm + small epsilon (ensures exit).
 
 from typing import List, Optional
 import os
@@ -43,8 +47,12 @@ from pydantic import BaseModel, Field, validator
 import cadquery as cq
 
 INCH_TO_MM = 25.4
-DEPTH_CLAMP_RATIO = 0.95  # never cut full thickness
-THROUGH_CUT_EPS_MM = 0.25  # ensures clean exit for through-cuts
+
+# Legacy behavior: never cut full thickness (blind pockets)
+DEPTH_CLAMP_RATIO = 0.95
+
+# Through-cut epsilon: ensures the cut cleanly exits the bottom face
+THROUGH_CUT_EPS_MM = 0.25
 
 # Small epsilon to avoid fillet edge-case when radius ~= half the side
 FILLET_EPS_MM = 1e-3
@@ -156,17 +164,14 @@ def _truthy_bool(v: Optional[bool]) -> bool:
 
 
 def _resolve_corner_style(block: Block) -> str:
-    # tolerate both camel + snake
     s = block.cornerStyle or block.corner_style
     return str(s).strip().lower() if s is not None else ""
 
 
 def _resolve_cropped_global(block: Block) -> bool:
-    # tolerate both camel + snake booleans
     if _truthy_bool(block.croppedCorners) or _truthy_bool(block.cropped_corners):
         return True
 
-    # ALSO accept cornerStyle="chamfer" (SVG/DXF wiring)
     corner_style = _resolve_corner_style(block)
     return corner_style == "chamfer"
 
@@ -185,12 +190,18 @@ def _resolve_cropped_for_layer(layer: FoamLayer, cropped_global: bool) -> bool:
 
 
 def _resolve_chamfer_in(block: Block) -> float:
-    # inches, default 1"
     v = _safe_pos(block.chamferIn) or _safe_pos(block.chamfer_in)
     return float(v) if v is not None else 1.0
 
 
-def build_layer_block(L_mm: float, W_mm: float, T_mm: float, z: float, cropped: bool, chamfer_mm: float):
+def build_layer_block(
+    L_mm: float,
+    W_mm: float,
+    T_mm: float,
+    z: float,
+    cropped: bool,
+    chamfer_mm: float,
+):
     """
     Build one layer block.
 
@@ -208,13 +219,10 @@ def build_layer_block(L_mm: float, W_mm: float, T_mm: float, z: float, cropped: 
             .translate((0, 0, z))
         )
 
-    # Clamp chamfer to be valid
     c = float(chamfer_mm)
     if not (c > 0):
         c = 1.0 * INCH_TO_MM
 
-    # Need enough room for a chamfer on both relevant edges
-    # (and to avoid self-intersections)
     if L_mm <= 2.0 * c or W_mm <= 2.0 * c:
         return (
             cq.Workplane("XY")
@@ -225,9 +233,6 @@ def build_layer_block(L_mm: float, W_mm: float, T_mm: float, z: float, cropped: 
     # Polygon with chamfers at:
     #  - LR corner (L,0) => (L-c,0) -> (L,c)
     #  - UL corner (0,W) => (0,W-c) -> (c,W)
-    #
-    # IMPORTANT:
-    # Point order must trace the perimeter without a diagonal jump.
     pts = [
         (0.0, 0.0),
         (L_mm - c, 0.0),
@@ -251,7 +256,6 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
     L_mm = layout.block.lengthIn * INCH_TO_MM
     W_mm = layout.block.widthIn * INCH_TO_MM
 
-    # Global crop corner intent (fallback if layer doesn't specify)
     cropped_global = _resolve_cropped_global(layout.block)
 
     chamfer_in = _resolve_chamfer_in(layout.block)
@@ -265,51 +269,54 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
         if T_mm <= 0:
             continue
 
-        # NEW: Per-layer cropped corner resolution
         cropped_layer = _resolve_cropped_for_layer(layer, cropped_global)
 
         base = build_layer_block(
-            L_mm, W_mm, T_mm, z_bottom,
+            L_mm,
+            W_mm,
+            T_mm,
+            z_bottom,
             cropped=cropped_layer,
-            chamfer_mm=chamfer_mm
+            chamfer_mm=chamfer_mm,
         )
         working = base
 
         # IMPORTANT: per-layer STEP must only use per-layer cavities.
         cavities = list(layer.cavities or [])
 
-        # ✅ Path-A: cut order matters for overlapping cavities.
-        # Cut shallow first, deep last to preserve stepped pockets.
-def _eff_depth_mm(c: Cavity) -> float:
-    try:
-        d_mm = float(c.depthIn) * INCH_TO_MM
-    except Exception:
-        return 0.0
+        # Compute effective depth used for ordering:
+        # - shallow first
+        # - deep last
+        # - through-cuts treated as "deepest"
+        def _eff_depth_mm(c: Cavity) -> float:
+            try:
+                d_mm = float(c.depthIn) * INCH_TO_MM
+            except Exception:
+                return 0.0
 
-    # Through-cut intent: allow deeper than thickness
-    if d_mm >= T_mm:
-        return T_mm + THROUGH_CUT_EPS_MM
+            if d_mm >= T_mm:
+                return T_mm + THROUGH_CUT_EPS_MM
 
-    # Blind pocket (legacy behavior)
-    return min(d_mm, T_mm * DEPTH_CLAMP_RATIO)
-
-
+            return min(d_mm, T_mm * DEPTH_CLAMP_RATIO)
 
         cavities.sort(key=_eff_depth_mm)
 
         for cav in cavities:
-            raw_d_mm = cav.depthIn * INCH_TO_MM
+            # Determine cut depth:
+            # - Through-cut if requested depth >= thickness
+            # - Else legacy blind pocket clamp
+            try:
+                req_mm = float(cav.depthIn) * INCH_TO_MM
+            except Exception:
+                continue
 
-# Through-cut when depth >= thickness
-if raw_d_mm >= T_mm:
-    cav_D = T_mm + THROUGH_CUT_EPS_MM
-else:
-    cav_D = min(raw_d_mm, T_mm * DEPTH_CLAMP_RATIO)
+            if req_mm >= T_mm:
+                cav_D = T_mm + THROUGH_CUT_EPS_MM
+            else:
+                cav_D = min(req_mm, T_mm * DEPTH_CLAMP_RATIO)
 
+            shape = (cav.shape or "rect").strip().lower()
 
-            shape = (cav.shape or "rect").lower()
-
-            # Support both "roundedrect" and plain "rect" with cornerRadiusIn set.
             corner_r_in = _safe_pos(cav.cornerRadiusIn) or _safe_pos(cav.corner_radius_in) or None
 
             z_top = z_bottom + T_mm
@@ -318,14 +325,13 @@ else:
             try:
                 if shape == "circle":
                     dia_in = cav.diameterIn or min(cav.lengthIn, cav.widthIn)
-                    dia_mm = dia_in * INCH_TO_MM
+                    dia_mm = float(dia_in) * INCH_TO_MM
                     r_mm = dia_mm / 2.0
 
                     # Convert editor top-left normalized coords -> CAD bottom-left coords
                     x_left = cav.x * L_mm
                     y_top_cad = W_mm * (1.0 - cav.y) - (2.0 * r_mm)
 
-                    # Clamp inside
                     x_left = max(0.0, min(L_mm - 2.0 * r_mm, x_left))
                     y_top_cad = max(0.0, min(W_mm - 2.0 * r_mm, y_top_cad))
 
@@ -341,8 +347,8 @@ else:
                     )
 
                 else:
-                    cav_L = cav.lengthIn * INCH_TO_MM
-                    cav_W = cav.widthIn * INCH_TO_MM
+                    cav_L = float(cav.lengthIn) * INCH_TO_MM
+                    cav_W = float(cav.widthIn) * INCH_TO_MM
 
                     if cav_L >= L_mm or cav_W >= W_mm:
                         continue
@@ -358,8 +364,7 @@ else:
                     # Rounded-rect pocket if radius is present and sane
                     r_mm = 0.0
                     if corner_r_in is not None and corner_r_in > 0:
-                        r_mm = corner_r_in * INCH_TO_MM
-                        # Clamp to avoid invalid fillet cases
+                        r_mm = float(corner_r_in) * INCH_TO_MM
                         max_r = (min(cav_L, cav_W) / 2.0) - FILLET_EPS_MM
                         if max_r <= 0:
                             r_mm = 0.0
@@ -367,7 +372,6 @@ else:
                             r_mm = max(0.0, min(r_mm, max_r))
 
                     if shape in ("roundedrect", "rounded_rect", "rounded-rect") or r_mm > 0:
-                        # Build the pocket as a 3D solid first, then fillet its vertical edges.
                         cx = x_left + (cav_L / 2.0)
                         cy = y_top_cad + (cav_W / 2.0)
 
@@ -380,11 +384,8 @@ else:
                         )
 
                         if r_mm > 0:
-                            # Fillet vertical edges (parallel to Z). This is reliable in CQ.
                             cavity = cavity.edges("|Z").fillet(r_mm)
-
                     else:
-                        # Square pocket (legacy behavior)
                         cavity = (
                             cq.Workplane("XY")
                             .box(cav_L, cav_W, cav_D, centered=(False, False, False))
@@ -394,6 +395,7 @@ else:
                 cut_result = working.cut(cavity)
                 if cut_result.val().Solids():
                     working = cut_result
+
             except Exception:
                 continue
 
