@@ -44,6 +44,8 @@ import cadquery as cq
 
 INCH_TO_MM = 25.4
 DEPTH_CLAMP_RATIO = 0.95  # never cut full thickness
+THROUGH_CUT_EPS_MM = 0.25  # ensures clean exit for through-cuts
+
 # Small epsilon to avoid fillet edge-case when radius ~= half the side
 FILLET_EPS_MM = 1e-3
 
@@ -278,18 +280,31 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
 
         # ✅ Path-A: cut order matters for overlapping cavities.
         # Cut shallow first, deep last to preserve stepped pockets.
-        def _eff_depth_mm(c: Cavity) -> float:
-            try:
-                d = float(c.depthIn) * INCH_TO_MM
-            except Exception:
-                d = 0.0
-            # clamp same as used later
-            return min(d, T_mm * DEPTH_CLAMP_RATIO)
+       def _eff_depth_mm(c: Cavity) -> float:
+    try:
+        d_mm = float(c.depthIn) * INCH_TO_MM
+    except Exception:
+        return 0.0
+
+    # Through-cut intent: allow deeper than thickness
+    if d_mm >= T_mm:
+        return T_mm + THROUGH_CUT_EPS_MM
+
+    # Blind pocket (legacy behavior)
+    return min(d_mm, T_mm * DEPTH_CLAMP_RATIO)
+
 
         cavities.sort(key=_eff_depth_mm)
 
         for cav in cavities:
-            cav_D = min(cav.depthIn * INCH_TO_MM, T_mm * DEPTH_CLAMP_RATIO)
+            raw_d_mm = cav.depthIn * INCH_TO_MM
+
+# Through-cut when depth >= thickness
+if raw_d_mm >= T_mm:
+    cav_D = T_mm + THROUGH_CUT_EPS_MM
+else:
+    cav_D = min(raw_d_mm, T_mm * DEPTH_CLAMP_RATIO)
+
 
             shape = (cav.shape or "rect").lower()
 
