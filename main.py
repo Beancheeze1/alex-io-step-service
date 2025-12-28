@@ -26,6 +26,13 @@
 #     - If a layer sets cropCorners true/false (or snake-case), STEP honors it
 #       for THAT layer only. If omitted, we fall back to the global intent.
 # - chamferIn is in inches, default 1" if omitted.
+#
+# NESTED CAVITY DEPTH FIX (Path A) - 12/27:
+# - When cavities overlap (one inside another), boolean cut ORDER matters.
+#   To preserve "stepped" pockets (large shallow + smaller deep), we cut
+#   shallow cavities first, then deeper cavities last.
+# - This does NOT change non-overlapping cavities.
+# - Depth reference remains the layer's top surface (correct).
 
 from typing import List, Optional
 import os
@@ -268,6 +275,18 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
 
         # IMPORTANT: per-layer STEP must only use per-layer cavities.
         cavities = list(layer.cavities or [])
+
+        # ✅ Path-A: cut order matters for overlapping cavities.
+        # Cut shallow first, deep last to preserve stepped pockets.
+        def _eff_depth_mm(c: Cavity) -> float:
+            try:
+                d = float(c.depthIn) * INCH_TO_MM
+            except Exception:
+                d = 0.0
+            # clamp same as used later
+            return min(d, T_mm * DEPTH_CLAMP_RATIO)
+
+        cavities.sort(key=_eff_depth_mm)
 
         for cav in cavities:
             cav_D = min(cav.depthIn * INCH_TO_MM, T_mm * DEPTH_CLAMP_RATIO)
