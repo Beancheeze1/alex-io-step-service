@@ -47,14 +47,8 @@ from pydantic import BaseModel, Field, validator
 import cadquery as cq
 
 INCH_TO_MM = 25.4
-
-# Legacy behavior: never cut full thickness (blind pockets)
 DEPTH_CLAMP_RATIO = 0.95
-
-# Through-cut epsilon: ensures the cut cleanly exits the bottom face
 THROUGH_CUT_EPS_MM = 0.25
-
-# Small epsilon to avoid fillet edge-case when radius ~= half the side
 FILLET_EPS_MM = 1e-3
 
 
@@ -65,11 +59,8 @@ class Cavity(BaseModel):
     x: float = Field(..., ge=0.0, le=1.0)
     y: float = Field(..., ge=0.0, le=1.0)
 
-    shape: Optional[str] = None           # "rect" | "circle" | "roundedRect" (optional)
-    diameterIn: Optional[float] = None    # for circle cavities
-
-    # NEW (Path A): optional rounded-rect radius (inches)
-    # Accept both snake/camel to be tolerant of upstream naming.
+    shape: Optional[str] = None
+    diameterIn: Optional[float] = None
     cornerRadiusIn: Optional[float] = None
     corner_radius_in: Optional[float] = None
 
@@ -85,10 +76,14 @@ class FoamLayer(BaseModel):
     label: Optional[str] = None
     cavities: Optional[List[Cavity]] = None
 
-    # NEW (Path A): per-layer cropped corner override (optional)
-    # If present, it overrides the global block cropped intent for this layer.
     cropCorners: Optional[bool] = None
     crop_corners: Optional[bool] = None
+
+    # NEW: rounded block corners
+    roundCorners: Optional[bool] = None
+    round_corners: Optional[bool] = None
+    roundRadiusIn: Optional[float] = None
+    round_radius_in: Optional[float] = None
 
     @validator("thicknessIn")
     def positive(cls, v: float) -> float:
@@ -102,16 +97,13 @@ class Block(BaseModel):
     widthIn: float
     thicknessIn: float
 
-    # Global crop-corners intent
     croppedCorners: Optional[bool] = None
     cropped_corners: Optional[bool] = None
 
-    # Keep chamfer size support (inches)
     chamferIn: Optional[float] = None
     chamfer_in: Optional[float] = None
 
-    # Accept "cornerStyle" to match SVG/DXF export wiring
-    cornerStyle: Optional[str] = None        # "square" | "chamfer"
+    cornerStyle: Optional[str] = None
     corner_style: Optional[str] = None
 
     @validator("lengthIn", "widthIn", "thicknessIn")
@@ -125,7 +117,7 @@ class Block(BaseModel):
         if v is None:
             return None
         if v <= 0:
-            raise ValueError("Chamfer must be > 0 when provided")
+            raise ValueError("Chamfer must be > 0")
         return v
 
 
@@ -163,25 +155,23 @@ def _truthy_bool(v: Optional[bool]) -> bool:
     return bool(v is True)
 
 
-def _resolve_corner_style(block: Block) -> str:
-    s = block.cornerStyle or block.corner_style
-    return str(s).strip().lower() if s is not None else ""
+def _resolve_round_for_layer(layer: FoamLayer) -> bool:
+    return bool(layer.roundCorners is True or layer.round_corners is True)
+
+
+def _resolve_round_radius_in(layer: FoamLayer) -> float:
+    v = _safe_pos(layer.roundRadiusIn) or _safe_pos(layer.round_radius_in)
+    return float(v) if v is not None else 0.25
 
 
 def _resolve_cropped_global(block: Block) -> bool:
     if _truthy_bool(block.croppedCorners) or _truthy_bool(block.cropped_corners):
         return True
-
-    corner_style = _resolve_corner_style(block)
-    return corner_style == "chamfer"
+    s = block.cornerStyle or block.corner_style
+    return (str(s).lower() == "chamfer") if s else False
 
 
 def _resolve_cropped_for_layer(layer: FoamLayer, cropped_global: bool) -> bool:
-    """
-    Per-layer override:
-      - If layer explicitly sets cropCorners true/false, honor it
-      - If omitted (None), fall back to global intent
-    """
     if layer.cropCorners is True or layer.crop_corners is True:
         return True
     if layer.cropCorners is False or layer.crop_corners is False:
@@ -194,24 +184,23 @@ def _resolve_chamfer_in(block: Block) -> float:
     return float(v) if v is not None else 1.0
 
 
-def build_layer_block(
-    L_mm: float,
-    W_mm: float,
-    T_mm: float,
-    z: float,
-    cropped: bool,
-    chamfer_mm: float,
-):
-    """
-    Build one layer block.
+def build_layer_block(L_mm, W_mm, T_mm, z, cropped, chamfer_mm, rounded, radius_mm):
+    # ROUNDED BLOCK
+    if rounded and radius_mm > 0:
+        r = float(radius_mm)
+        max_r = (min(L_mm, W_mm) / 2.0) - FILLET_EPS_MM
+        r = max(0.0, min(r, max_r))
+        solid = (
+            cq.Workplane("XY")
+            .rect(L_mm, W_mm)
+            .extrude(T_mm)
+            .edges("|Z")
+            .fillet(r)
+            .translate((0, 0, z))
+        )
+        return solid
 
-    Default: rectangular prism at origin.
-    If cropped: chamfer TWO corners in the XY profile:
-      - upper-left  (0, W)
-      - lower-right (L, 0)
-
-    Coordinates are CAD bottom-left origin.
-    """
+    # SQUARE OR CHAMFERED (existing logic)
     if not cropped:
         return (
             cq.Workplane("XY")
@@ -220,19 +209,6 @@ def build_layer_block(
         )
 
     c = float(chamfer_mm)
-    if not (c > 0):
-        c = 1.0 * INCH_TO_MM
-
-    if L_mm <= 2.0 * c or W_mm <= 2.0 * c:
-        return (
-            cq.Workplane("XY")
-            .box(L_mm, W_mm, T_mm, centered=(False, False, False))
-            .translate((0, 0, z))
-        )
-
-    # Polygon with chamfers at:
-    #  - LR corner (L,0) => (L-c,0) -> (L,c)
-    #  - UL corner (0,W) => (0,W-c) -> (c,W)
     pts = [
         (0.0, 0.0),
         (L_mm - c, 0.0),
@@ -241,8 +217,7 @@ def build_layer_block(
         (c, W_mm),
         (0.0, W_mm - c),
     ]
-
-    solid = (
+    return (
         cq.Workplane("XY")
         .polyline(pts)
         .close()
