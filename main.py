@@ -27,6 +27,12 @@
 #       for THAT layer only. If omitted, we fall back to the global intent.
 # - chamferIn is in inches, default 1" if omitted.
 #
+# NEW (Path A) - ROUNDED OUTER BLOCK CORNERS:
+# - Per-layer roundCorners + roundRadiusIn (also snake-case variants).
+# - If enabled for a layer, the outer block is filleted on the vertical edges.
+# - SAFE fallback: if fillet fails, fall back to square block (no rounding).
+# - Rounded corners take precedence over chamfer/crop for that layer.
+#
 # NESTED CAVITY DEPTH FIX (Path A) - 12/27:
 # - When cavities overlap (one inside another), boolean cut ORDER matters.
 #   To preserve "stepped" pockets (large shallow + smaller deep), we cut
@@ -47,9 +53,18 @@ from pydantic import BaseModel, Field, validator
 import cadquery as cq
 
 INCH_TO_MM = 25.4
+
+# Legacy behavior: never cut full thickness (blind pockets)
 DEPTH_CLAMP_RATIO = 0.95
+
+# Through-cut epsilon: ensures the cut cleanly exits the bottom face
 THROUGH_CUT_EPS_MM = 0.25
+
+# Small epsilon to avoid fillet edge-case when radius ~= half the side
 FILLET_EPS_MM = 1e-3
+
+# Default outer round radius (inches) when roundCorners is true but radius omitted/invalid
+DEFAULT_OUTER_ROUND_IN = 0.25
 
 
 class Cavity(BaseModel):
@@ -59,8 +74,10 @@ class Cavity(BaseModel):
     x: float = Field(..., ge=0.0, le=1.0)
     y: float = Field(..., ge=0.0, le=1.0)
 
-    shape: Optional[str] = None
-    diameterIn: Optional[float] = None
+    shape: Optional[str] = None           # "rect" | "circle" | "roundedRect" (optional)
+    diameterIn: Optional[float] = None    # for circle cavities
+
+    # NEW (Path A): optional rounded-rect radius (inches)
     cornerRadiusIn: Optional[float] = None
     corner_radius_in: Optional[float] = None
 
@@ -76,10 +93,11 @@ class FoamLayer(BaseModel):
     label: Optional[str] = None
     cavities: Optional[List[Cavity]] = None
 
+    # Per-layer cropped corner override (optional)
     cropCorners: Optional[bool] = None
     crop_corners: Optional[bool] = None
 
-    # NEW: rounded block corners
+    # NEW: per-layer rounded outer corners (optional)
     roundCorners: Optional[bool] = None
     round_corners: Optional[bool] = None
     roundRadiusIn: Optional[float] = None
@@ -97,13 +115,16 @@ class Block(BaseModel):
     widthIn: float
     thicknessIn: float
 
+    # Global crop-corners intent
     croppedCorners: Optional[bool] = None
     cropped_corners: Optional[bool] = None
 
+    # Keep chamfer size support (inches)
     chamferIn: Optional[float] = None
     chamfer_in: Optional[float] = None
 
-    cornerStyle: Optional[str] = None
+    # Accept "cornerStyle" to match SVG/DXF export wiring
+    cornerStyle: Optional[str] = None        # "square" | "chamfer"
     corner_style: Optional[str] = None
 
     @validator("lengthIn", "widthIn", "thicknessIn")
@@ -117,7 +138,7 @@ class Block(BaseModel):
         if v is None:
             return None
         if v <= 0:
-            raise ValueError("Chamfer must be > 0")
+            raise ValueError("Chamfer must be > 0 when provided")
         return v
 
 
@@ -155,23 +176,25 @@ def _truthy_bool(v: Optional[bool]) -> bool:
     return bool(v is True)
 
 
-def _resolve_round_for_layer(layer: FoamLayer) -> bool:
-    return bool(layer.roundCorners is True or layer.round_corners is True)
-
-
-def _resolve_round_radius_in(layer: FoamLayer) -> float:
-    v = _safe_pos(layer.roundRadiusIn) or _safe_pos(layer.round_radius_in)
-    return float(v) if v is not None else 0.25
+def _resolve_corner_style(block: Block) -> str:
+    s = block.cornerStyle or block.corner_style
+    return str(s).strip().lower() if s is not None else ""
 
 
 def _resolve_cropped_global(block: Block) -> bool:
     if _truthy_bool(block.croppedCorners) or _truthy_bool(block.cropped_corners):
         return True
-    s = block.cornerStyle or block.corner_style
-    return (str(s).lower() == "chamfer") if s else False
+
+    corner_style = _resolve_corner_style(block)
+    return corner_style == "chamfer"
 
 
 def _resolve_cropped_for_layer(layer: FoamLayer, cropped_global: bool) -> bool:
+    """
+    Per-layer override:
+      - If layer explicitly sets cropCorners true/false, honor it
+      - If omitted (None), fall back to global intent
+    """
     if layer.cropCorners is True or layer.crop_corners is True:
         return True
     if layer.cropCorners is False or layer.crop_corners is False:
@@ -184,31 +207,89 @@ def _resolve_chamfer_in(block: Block) -> float:
     return float(v) if v is not None else 1.0
 
 
-def build_layer_block(L_mm, W_mm, T_mm, z, cropped, chamfer_mm, rounded, radius_mm):
-    # ROUNDED BLOCK
-    if rounded and radius_mm > 0:
-        r = float(radius_mm)
-        max_r = (min(L_mm, W_mm) / 2.0) - FILLET_EPS_MM
-        r = max(0.0, min(r, max_r))
-        solid = (
-            cq.Workplane("XY")
-            .rect(L_mm, W_mm)
-            .extrude(T_mm)
-            .edges("|Z")
-            .fillet(r)
-            .translate((0, 0, z))
-        )
-        return solid
+def _resolve_round_for_layer(layer: FoamLayer) -> bool:
+    return bool(layer.roundCorners is True or layer.round_corners is True)
 
-    # SQUARE OR CHAMFERED (existing logic)
-    if not cropped:
+
+def _resolve_round_radius_in(layer: FoamLayer) -> float:
+    v = _safe_pos(layer.roundRadiusIn) or _safe_pos(layer.round_radius_in)
+    return float(v) if v is not None else DEFAULT_OUTER_ROUND_IN
+
+
+def build_layer_block(
+    L_mm: float,
+    W_mm: float,
+    T_mm: float,
+    z: float,
+    cropped: bool,
+    chamfer_mm: float,
+    rounded: bool,
+    radius_mm: float,
+):
+    """
+    Build one layer block.
+
+    Coordinates are CAD bottom-left origin.
+    Base block is always from (0,0, z) to (L, W, z+T).
+
+    Precedence:
+      - If rounded: fillet vertical edges (SAFE fallback if fillet fails)
+      - Else if cropped: chamfer two corners (UL and LR) using polygon profile
+      - Else: square box
+    """
+    # Always start from a square base in the correct coordinate system
+    def _square():
         return (
             cq.Workplane("XY")
             .box(L_mm, W_mm, T_mm, centered=(False, False, False))
             .translate((0, 0, z))
         )
 
+    # Rounded outer corners (takes precedence over crop)
+    if rounded:
+        r = float(radius_mm) if radius_mm else 0.0
+        if r > 0:
+            max_r = (min(L_mm, W_mm) / 2.0) - FILLET_EPS_MM
+            if max_r > 0:
+                r = max(0.0, min(r, max_r))
+            else:
+                r = 0.0
+
+        if r > 0:
+            try:
+                # Build square block at (0,0) then fillet vertical edges only
+                solid = (
+                    cq.Workplane("XY")
+                    .box(L_mm, W_mm, T_mm, centered=(False, False, False))
+                    .edges("|Z")
+                    .fillet(r)
+                    .translate((0, 0, z))
+                )
+                # Ensure we still have a solid; otherwise fallback
+                if solid.val().Solids():
+                    return solid
+            except Exception:
+                # SAFE fallback
+                return _square()
+
+        # If radius invalid/zero, just return square
+        return _square()
+
+    # Square block
+    if not cropped:
+        return _square()
+
+    # Cropped corners (existing behavior)
     c = float(chamfer_mm)
+    if not (c > 0):
+        c = 1.0 * INCH_TO_MM
+
+    if L_mm <= 2.0 * c or W_mm <= 2.0 * c:
+        return _square()
+
+    # Polygon with chamfers at:
+    #  - LR corner (L,0) => (L-c,0) -> (L,c)
+    #  - UL corner (0,W) => (0,W-c) -> (c,W)
     pts = [
         (0.0, 0.0),
         (L_mm - c, 0.0),
@@ -217,7 +298,8 @@ def build_layer_block(L_mm, W_mm, T_mm, z, cropped, chamfer_mm, rounded, radius_
         (c, W_mm),
         (0.0, W_mm - c),
     ]
-    return (
+
+    solid = (
         cq.Workplane("XY")
         .polyline(pts)
         .close()
@@ -246,6 +328,10 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
 
         cropped_layer = _resolve_cropped_for_layer(layer, cropped_global)
 
+        rounded_layer = _resolve_round_for_layer(layer)
+        radius_in = _resolve_round_radius_in(layer)
+        radius_mm = float(radius_in) * INCH_TO_MM if radius_in else 0.0
+
         base = build_layer_block(
             L_mm,
             W_mm,
@@ -253,6 +339,8 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
             z_bottom,
             cropped=cropped_layer,
             chamfer_mm=chamfer_mm,
+            rounded=rounded_layer,
+            radius_mm=radius_mm,
         )
         working = base
 
