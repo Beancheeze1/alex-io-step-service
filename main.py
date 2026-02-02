@@ -48,7 +48,8 @@ from typing import List, Optional
 import os
 import tempfile
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
+
 from pydantic import BaseModel, Field, validator
 import cadquery as cq
 
@@ -482,6 +483,83 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
 
 
 def export_step_text(solid: cq.Workplane) -> str:
+    def stl_to_faces_json(stl_bytes: bytes):
+    """
+    Load STL and return a Forge-style faces_json object:
+      {
+        "units": "in",
+        "outerLoopIndex": 0,
+        "loops": [
+          { "idx": 0, "closed": True, "points": [{"x":..,"y":..}, ...] }
+        ]
+      }
+
+    Path A (minimal):
+    - Import STL into CadQuery
+    - Project to XY plane to get silhouette wires
+    - Pick the largest closed wire as the outer loop
+    - Discretize to points
+    - Output raw XY as inches (unitless STL => treat as inches)
+    """
+    with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as tmp:
+        stl_path = tmp.name
+        tmp.write(stl_bytes)
+
+    try:
+        shape = cq.importers.importShape(stl_path)
+        wp = cq.Workplane("XY").add(shape)
+
+        # Project to XY to get silhouette wires
+        proj = wp.projectToPlane(plane="XY")
+        wires = proj.wires().vals()
+        if not wires:
+            raise ValueError("No silhouette wires produced from STL projection")
+
+        best = None
+        best_area = -1.0
+
+        for w in wires:
+            try:
+                if not w.IsClosed():
+                    continue
+                area = abs(cq.Shape(w).Area())
+                if area > best_area:
+                    best_area = area
+                    best = w
+            except Exception:
+                continue
+
+        if best is None:
+            raise ValueError("No closed silhouette wire found from STL projection")
+
+        # Discretize edges into a stable point list
+        pts = cq.Shape(best).Edges().val().discretize(240)
+        if not pts or len(pts) < 3:
+            raise ValueError("Silhouette discretize produced too few points")
+
+        out_pts = [{"x": float(p.x), "y": float(p.y)} for p in pts]
+
+        # Ensure loop closure
+        if out_pts[0]["x"] != out_pts[-1]["x"] or out_pts[0]["y"] != out_pts[-1]["y"]:
+            out_pts.append(out_pts[0])
+
+        return {
+            "units": "in",
+            "outerLoopIndex": 0,
+            "loops": [
+                {
+                    "idx": 0,
+                    "closed": True,
+                    "points": out_pts,
+                }
+            ],
+        }
+    finally:
+        try:
+            os.remove(stl_path)
+        except OSError:
+            pass
+
     with tempfile.NamedTemporaryFile(suffix=".step", delete=False) as tmp:
         path = tmp.name
 
@@ -496,7 +574,20 @@ def export_step_text(solid: cq.Workplane) -> str:
             pass
 
     return data.decode("utf-8", errors="ignore")
+@app.post("/faces-from-stl")
+async def faces_from_stl(file: UploadFile = File(...)):
+    try:
+        data = await file.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="Empty STL upload")
 
+        faces = stl_to_faces_json(data)
+        return {"ok": True, "faces_json": faces}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print("[STEP-SVC] STL faces error:", repr(exc))
+        raise HTTPException(status_code=400, detail=f"Failed to extract faces from STL: {exc}")
 
 @app.post("/step-from-layout")
 async def step_from_layout(payload: StepRequest):
