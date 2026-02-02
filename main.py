@@ -49,7 +49,6 @@ import os
 import tempfile
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
-
 from pydantic import BaseModel, Field, validator
 import cadquery as cq
 
@@ -482,8 +481,7 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
     return solid
 
 
-def export_step_text(solid: cq.Workplane) -> str:
-    def stl_to_faces_json(stl_bytes: bytes):
+def stl_to_faces_json(stl_bytes: bytes):
     """
     Load STL and return a Forge-style faces_json object:
       {
@@ -509,7 +507,6 @@ def export_step_text(solid: cq.Workplane) -> str:
         shape = cq.importers.importShape(stl_path)
         wp = cq.Workplane("XY").add(shape)
 
-        # Project to XY to get silhouette wires
         proj = wp.projectToPlane(plane="XY")
         wires = proj.wires().vals()
         if not wires:
@@ -532,14 +529,12 @@ def export_step_text(solid: cq.Workplane) -> str:
         if best is None:
             raise ValueError("No closed silhouette wire found from STL projection")
 
-        # Discretize edges into a stable point list
         pts = cq.Shape(best).Edges().val().discretize(240)
         if not pts or len(pts) < 3:
             raise ValueError("Silhouette discretize produced too few points")
 
         out_pts = [{"x": float(p.x), "y": float(p.y)} for p in pts]
 
-        # Ensure loop closure
         if out_pts[0]["x"] != out_pts[-1]["x"] or out_pts[0]["y"] != out_pts[-1]["y"]:
             out_pts.append(out_pts[0])
 
@@ -560,6 +555,8 @@ def export_step_text(solid: cq.Workplane) -> str:
         except OSError:
             pass
 
+
+def export_step_text(solid: cq.Workplane) -> str:
     with tempfile.NamedTemporaryFile(suffix=".step", delete=False) as tmp:
         path = tmp.name
 
@@ -574,6 +571,8 @@ def export_step_text(solid: cq.Workplane) -> str:
             pass
 
     return data.decode("utf-8", errors="ignore")
+
+
 @app.post("/faces-from-stl")
 async def faces_from_stl(file: UploadFile = File(...)):
     try:
@@ -588,6 +587,7 @@ async def faces_from_stl(file: UploadFile = File(...)):
     except Exception as exc:
         print("[STEP-SVC] STL faces error:", repr(exc))
         raise HTTPException(status_code=400, detail=f"Failed to extract faces from STL: {exc}")
+
 
 @app.post("/step-from-layout")
 async def step_from_layout(payload: StepRequest):
