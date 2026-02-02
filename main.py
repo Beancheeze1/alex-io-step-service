@@ -504,7 +504,7 @@ def stl_to_faces_json(stl_bytes: bytes):
         tmp.write(stl_bytes)
 
     try:
-        shape = cq.importers.importShape(stl_path)
+        shape = cq.importers.importShape("STL", stl_path)
         wp = cq.Workplane("XY").add(shape)
 
         proj = wp.projectToPlane(plane="XY")
