@@ -4,4 +4,4 @@ pydantic-core==2.16.3
 uvicorn[standard]
 cadquery
 cadquery-ocp
-
+python-multipart==0.0.9
