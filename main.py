@@ -497,8 +497,8 @@ def stl_to_faces_json(stl_bytes: bytes):
     - Corner healing via vertex snapping (tolerance grid)
     - Reduced tolerance (1/64") to avoid collapsing small cavities
     - Angle-based loop walking
-    - NEW: loop canonicalization + de-duplication (prevents stacked cavities)
-    - NEW: outerLoopIndex computed AFTER filtering/deduping (prevents outer being treated as a cavity)
+    - Loop canonicalization + de-duplication (prevents stacked cavities)
+    - outerLoopIndex computed AFTER filtering/deduping (prevents outer being treated as a cavity)
     """
     from collections import defaultdict
     import math
@@ -687,9 +687,8 @@ def stl_to_faces_json(stl_bytes: bytes):
             # pts_xy is list of (x,y) with closure optional
             if len(pts_xy) < 3:
                 return 0.0
-            if pts_xy[0] == pts_xy[-1]:
-                pts = pts_xy
-            else:
+            pts = pts_xy
+            if pts[0] != pts[-1]:
                 pts = pts_xy + [pts_xy[0]]
             a2 = 0.0
             for i in range(len(pts) - 1):
@@ -697,12 +696,20 @@ def stl_to_faces_json(stl_bytes: bytes):
             return abs(a2) * 0.5
 
         def canonicalize_loop(pts_xy):
-            # remove duplicate end if present
-            pts = pts_xy[:-1] if (len(pts_xy) > 1 and pts_xy[0] == pts_xy[-1]) else list(pts_xy)
+            """
+            Normalize loop representation so the same loop dedupes across:
+              - different start index
+              - reversed direction
+            Returns CLOSED list (last == first).
+            """
+            if len(pts_xy) < 4:
+                return pts_xy
+
+            # remove trailing closure for canonical work
+            pts = pts_xy[:-1] if pts_xy[0] == pts_xy[-1] else list(pts_xy)
             if len(pts) < 3:
                 return pts_xy
 
-            # rotate so the smallest (x,y) lexicographically is first
             def rotate_to_min(seq):
                 mi = min(range(len(seq)), key=lambda i: (seq[i][0], seq[i][1]))
                 return seq[mi:] + seq[:mi]
@@ -710,12 +717,10 @@ def stl_to_faces_json(stl_bytes: bytes):
             fwd = rotate_to_min(pts)
             rev = rotate_to_min(list(reversed(pts)))
 
-            # choose lexicographically smaller representation for stable dedupe
             rep_fwd = tuple((round(x, 6), round(y, 6)) for (x, y) in fwd)
             rep_rev = tuple((round(x, 6), round(y, 6)) for (x, y) in rev)
-            chosen = fwd if rep_fwd <= rep_rev else rev
 
-            # re-close
+            chosen = fwd if rep_fwd <= rep_rev else rev
             return chosen + [chosen[0]]
 
         # 7) Shift to (0,0) (native), then scale to inches
@@ -728,40 +733,27 @@ def stl_to_faces_json(stl_bytes: bytes):
             pts_in = [((p[0] - min_x) * scale, (p[1] - min_y) * scale) for p in loop]
             loops_in.append(pts_in)
 
-        # 8) Canonicalize + de-dup loops
-        dedup_map = {}  # signature -> pts_in
+        # 8) Canonicalize + de-dup loops (stable across reverse / start-index)
+        # Signature is the canonical vertex sequence, rounded.
+        dedup = {}
         for pts_in in loops_in:
             can = canonicalize_loop(pts_in)
             if len(can) < 4 or can[0] != can[-1]:
                 continue
 
-            xs2 = [p[0] for p in can]
-            ys2 = [p[1] for p in can]
-            bbox = (min(xs2), min(ys2), max(xs2), max(ys2))
-            area = poly_area_xy(can)
-
-            # signature: bbox + area + vertex count, with rounding
-            sig = (
-                round(bbox[0], 5),
-                round(bbox[1], 5),
-                round(bbox[2], 5),
-                round(bbox[3], 5),
-                round(area, 6),
-                len(can),
-            )
-
-            # keep the larger-area loop if collision (rare, but safe)
-            if sig in dedup_map:
-                if area > poly_area_xy(dedup_map[sig]):
-                    dedup_map[sig] = can
+            sig = tuple((round(x, 6), round(y, 6)) for (x, y) in can)
+            if sig in dedup:
+                # Keep the higher-area one (should be identical; this is defensive)
+                if poly_area_xy(can) > poly_area_xy(dedup[sig]):
+                    dedup[sig] = can
             else:
-                dedup_map[sig] = can
+                dedup[sig] = can
 
-        loops_can = list(dedup_map.values())
+        loops_can = list(dedup.values())
         if not loops_can:
             raise ValueError("No valid loops after dedupe")
 
-        # 9) Drop microscopic loops (noise) — LESS aggressive to avoid losing cavities
+        # 9) Drop microscopic loops (noise) — conservative (avoid losing cavities)
         min_area_in2 = (STL_HEAL_TOL_IN * STL_HEAL_TOL_IN) * 0.10
         filtered = [l for l in loops_can if poly_area_xy(l) >= min_area_in2]
         if not filtered:
