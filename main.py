@@ -67,6 +67,9 @@ FILLET_EPS_MM = 1e-3
 # Default outer round radius (inches) when roundCorners is true but radius omitted/invalid
 DEFAULT_OUTER_ROUND_IN = 0.25
 
+# STL corner heal tolerance (inches). Used only in stl_to_faces_json().
+STL_HEAL_TOL_IN = 0.03125  # 1/32"
+
 
 class Cavity(BaseModel):
     lengthIn: float
@@ -489,13 +492,19 @@ def _convex_hull_2d(points):
 
 def stl_to_faces_json(stl_bytes: bytes):
     """
-    Forge-equivalent STL → faces_json extraction.
+    Forge-equivalent STL → faces_json extraction (top-face boundary edges),
+    with corner healing for "nearly connected" corners.
 
-    Key fix:
-    - Ensure all returned numbers are plain Python float (no numpy.float32),
-      so FastAPI can JSON-encode the response.
+    - Finds upward-facing triangles
+    - Chooses largest top plane
+    - Extracts boundary edges (count==1)
+    - HEAL: snaps XY vertices to a tolerance grid (default 1/32")
+    - Drops tiny edges (noise)
+    - Assembles closed loops (outer + holes)
+    - Returns inches; auto-converts mm→in when geometry is "large"
     """
     from collections import defaultdict
+    import math
 
     with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as tmp:
         stl_path = tmp.name
@@ -505,7 +514,7 @@ def stl_to_faces_json(stl_bytes: bytes):
         m = stlmesh.Mesh.from_file(stl_path)
         tris = m.vectors  # (n, 3, 3) numpy floats
 
-        # 1) Upward-facing triangles
+        # 1) Upward-facing triangles (top-ish)
         top_tris = []
         for tri in tris:
             v1, v2, v3 = tri
@@ -534,14 +543,58 @@ def stl_to_faces_json(stl_bytes: bytes):
 
         plane_tris = max(planes.values(), key=lambda lst: sum(tri_area(t) for t in lst))
 
-        # 4) Count edges; boundary edges appear once
+        # --- Determine native span (for mm/in heuristic + heal tolerance in native units) ---
+        raw_xs = []
+        raw_ys = []
+        for tri in plane_tris:
+            raw_xs.extend([float(tri[0][0]), float(tri[1][0]), float(tri[2][0])])
+            raw_ys.extend([float(tri[0][1]), float(tri[1][1]), float(tri[2][1])])
+
+        if not raw_xs or not raw_ys:
+            raise ValueError("Selected top plane has no XY vertices")
+
+        raw_span = max(max(raw_xs) - min(raw_xs), max(raw_ys) - min(raw_ys))
+        assume_mm = float(raw_span) > 120.0
+
+        scale = (1.0 / INCH_TO_MM) if assume_mm else 1.0
+
+        # Heal tolerance expressed in STL native units
+        tol_native = float(STL_HEAL_TOL_IN) * (INCH_TO_MM if assume_mm else 1.0)
+        if not (tol_native > 0.0):
+            tol_native = 1e-6
+
+        # Drop tiny edges shorter than half the heal tol
+        min_edge = 0.5 * tol_native
+
+        # 4) Count edges; boundary edges appear once (with snapping/healing)
         edge_count = defaultdict(int)
 
+        # Map quantized grid key -> canonical snapped coordinate (native units)
+        canon = {}
+
+        def snap_xy(x, y):
+            # quantize to tolerance grid (native units)
+            qx = int(round(float(x) / tol_native))
+            qy = int(round(float(y) / tol_native))
+            key = (qx, qy)
+            if key in canon:
+                return canon[key]
+            sx = float(qx) * tol_native
+            sy = float(qy) * tol_native
+            canon[key] = (sx, sy)
+            return canon[key]
+
         def edge_key(a, b):
-            ax, ay = float(a[0]), float(a[1])
-            bx, by = float(b[0]), float(b[1])
-            p1 = (round(ax, 5), round(ay, 5))
-            p2 = (round(bx, 5), round(by, 5))
+            ax, ay = snap_xy(a[0], a[1])
+            bx, by = snap_xy(b[0], b[1])
+
+            # drop tiny/noise edges
+            if math.hypot(bx - ax, by - ay) < min_edge:
+                return None
+
+            # store as plain python floats
+            p1 = (float(ax), float(ay))
+            p2 = (float(bx), float(by))
             return tuple(sorted((p1, p2)))
 
         for tri in plane_tris:
@@ -552,6 +605,8 @@ def stl_to_faces_json(stl_bytes: bytes):
             ]
             for i in range(3):
                 e = edge_key(pts[i], pts[(i + 1) % 3])
+                if e is None:
+                    continue
                 edge_count[e] += 1
 
         boundary_edges = [e for e, c in edge_count.items() if c == 1]
@@ -600,6 +655,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                             break
 
                     if cand is None:
+                        # allow closing back to start if present
                         if cur == start:
                             break
                         for nn in nbs:
@@ -622,15 +678,10 @@ def stl_to_faces_json(stl_bytes: bytes):
         if not loops:
             raise ValueError("Failed to assemble loops from boundary edges")
 
-        # 6) Scale detection + shift to (0,0)
+        # 6) Shift to (0,0) and scale to inches
         xs = [p[0] for loop in loops for p in loop]
         ys = [p[1] for loop in loops for p in loop]
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
-        span = max(max_x - min_x, max_y - min_y)
-
-        assume_mm = float(span) > 120.0
-        scale = (1.0 / INCH_TO_MM) if assume_mm else 1.0
+        min_x, min_y = min(xs), min(ys)
 
         out_loops = []
         for idx, loop in enumerate(loops):
