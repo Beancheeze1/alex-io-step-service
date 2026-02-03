@@ -68,7 +68,8 @@ FILLET_EPS_MM = 1e-3
 DEFAULT_OUTER_ROUND_IN = 0.25
 
 # STL corner heal tolerance (inches). Used only in stl_to_faces_json().
-STL_HEAL_TOL_IN = 0.03125  # 1/32"
+# Dialed back from 1/32" to 1/64" to avoid merging/suppressing small cavities.
+STL_HEAL_TOL_IN = 0.015625  # 1/64"
 
 
 class Cavity(BaseModel):
@@ -492,16 +493,10 @@ def _convex_hull_2d(points):
 
 def stl_to_faces_json(stl_bytes: bytes):
     """
-    Forge-equivalent STL → faces_json extraction (top-face boundary edges),
-    with corner healing for "nearly connected" corners.
-
-    - Finds upward-facing triangles
-    - Chooses largest top plane
-    - Extracts boundary edges (count==1)
-    - HEAL: snaps XY vertices to a tolerance grid (default 1/32")
-    - Drops tiny edges (noise)
-    - Assembles closed loops (outer + holes)
-    - Returns inches; auto-converts mm→in when geometry is "large"
+    STL → faces_json extraction (top-face boundary edges) with:
+    - Corner healing via vertex snapping (tolerance grid)
+    - Reduced tolerance (1/64") to avoid collapsing small cavities
+    - Angle-based loop walking to follow non-rectangular cavity shapes better
     """
     from collections import defaultdict
     import math
@@ -520,7 +515,7 @@ def stl_to_faces_json(stl_bytes: bytes):
             v1, v2, v3 = tri
             ux, uy, uz = v2 - v1
             vx, vy, vz = v3 - v1
-            nz = ux * vy - uy * vx  # z-component of cross product
+            nz = ux * vy - uy * vx
             if float(nz) > 0.0:
                 top_tris.append(tri)
 
@@ -555,7 +550,6 @@ def stl_to_faces_json(stl_bytes: bytes):
 
         raw_span = max(max(raw_xs) - min(raw_xs), max(raw_ys) - min(raw_ys))
         assume_mm = float(raw_span) > 120.0
-
         scale = (1.0 / INCH_TO_MM) if assume_mm else 1.0
 
         # Heal tolerance expressed in STL native units
@@ -563,17 +557,14 @@ def stl_to_faces_json(stl_bytes: bytes):
         if not (tol_native > 0.0):
             tol_native = 1e-6
 
-        # Drop tiny edges shorter than half the heal tol
-        min_edge = 0.5 * tol_native
+        # Be less aggressive dropping edges (previously tol/2 was too harsh for small cavities)
+        min_edge = 0.2 * tol_native
 
         # 4) Count edges; boundary edges appear once (with snapping/healing)
         edge_count = defaultdict(int)
-
-        # Map quantized grid key -> canonical snapped coordinate (native units)
         canon = {}
 
         def snap_xy(x, y):
-            # quantize to tolerance grid (native units)
             qx = int(round(float(x) / tol_native))
             qy = int(round(float(y) / tol_native))
             key = (qx, qy)
@@ -588,11 +579,9 @@ def stl_to_faces_json(stl_bytes: bytes):
             ax, ay = snap_xy(a[0], a[1])
             bx, by = snap_xy(b[0], b[1])
 
-            # drop tiny/noise edges
             if math.hypot(bx - ax, by - ay) < min_edge:
                 return None
 
-            # store as plain python floats
             p1 = (float(ax), float(ay))
             p2 = (float(bx), float(by))
             return tuple(sorted((p1, p2)))
@@ -613,7 +602,7 @@ def stl_to_faces_json(stl_bytes: bytes):
         if not boundary_edges:
             raise ValueError("No boundary edges found on selected top plane")
 
-        # 5) Assemble loops from boundary edge graph
+        # 5) Build adjacency
         from collections import defaultdict as _dd
 
         adj = _dd(list)
@@ -621,55 +610,72 @@ def stl_to_faces_json(stl_bytes: bytes):
             adj[a].append(b)
             adj[b].append(a)
 
-        used = set()
+        # 6) Angle-based loop walking (better for non-rect shapes / junctions)
+        used_dir = set()
 
-        def edge_id(p, q):
-            return tuple(sorted((p, q)))
+        def dir_id(p, q):
+            return (p, q)
+
+        def turn_angle(prev_pt, cur_pt, nxt_pt):
+            # returns angle in [0, 2pi): smaller means "straighter / slight left"
+            ax = cur_pt[0] - prev_pt[0]
+            ay = cur_pt[1] - prev_pt[1]
+            bx = nxt_pt[0] - cur_pt[0]
+            by = nxt_pt[1] - cur_pt[1]
+            # cross and dot
+            cross = ax * by - ay * bx
+            dot = ax * bx + ay * by
+            ang = math.atan2(cross, dot)
+            if ang < 0:
+                ang += 2.0 * math.pi
+            return ang
 
         loops = []
+        max_steps = max(1000, len(boundary_edges) * 2)
 
         for start in list(adj.keys()):
             for nxt in adj[start]:
-                eid = edge_id(start, nxt)
-                if eid in used:
+                if dir_id(start, nxt) in used_dir:
                     continue
 
-                loop = [start]
-                prev = None
-                cur = start
-                neighbor = nxt
+                loop = [start, nxt]
+                used_dir.add(dir_id(start, nxt))
 
-                while True:
-                    used.add(edge_id(cur, neighbor))
-                    loop.append(neighbor)
+                prev = start
+                cur = nxt
 
-                    prev, cur = cur, neighbor
-                    nbs = adj[cur]
-
-                    cand = None
-                    for nn in nbs:
-                        if nn == prev:
-                            continue
-                        if edge_id(cur, nn) not in used:
-                            cand = nn
-                            break
-
-                    if cand is None:
-                        # allow closing back to start if present
-                        if cur == start:
-                            break
-                        for nn in nbs:
-                            if nn != prev:
-                                cand = nn
-                                break
-
-                    if cand is None:
+                steps = 0
+                while steps < max_steps:
+                    steps += 1
+                    nbrs = adj[cur]
+                    if not nbrs:
                         break
 
-                    neighbor = cand
-                    if neighbor == start:
-                        used.add(edge_id(cur, neighbor))
-                        loop.append(start)
+                    # Candidate next points excluding immediate backtrack when possible
+                    cands = [p for p in nbrs if p != prev]
+                    if not cands:
+                        cands = [prev]  # forced backtrack
+
+                    # Choose next by smallest turning angle from incoming segment
+                    best = None
+                    best_ang = None
+                    for cand in cands:
+                        if dir_id(cur, cand) in used_dir:
+                            continue
+                        ang = turn_angle(prev, cur, cand)
+                        if best is None or ang < best_ang:
+                            best = cand
+                            best_ang = ang
+
+                    if best is None:
+                        break
+
+                    used_dir.add(dir_id(cur, best))
+                    loop.append(best)
+
+                    prev, cur = cur, best
+
+                    if cur == start:
                         break
 
                 if len(loop) >= 4 and loop[0] == loop[-1]:
@@ -678,7 +684,7 @@ def stl_to_faces_json(stl_bytes: bytes):
         if not loops:
             raise ValueError("Failed to assemble loops from boundary edges")
 
-        # 6) Shift to (0,0) and scale to inches
+        # 7) Shift to (0,0) and scale to inches
         xs = [p[0] for loop in loops for p in loop]
         ys = [p[1] for loop in loops for p in loop]
         min_x, min_y = min(xs), min(ys)
@@ -688,16 +694,26 @@ def stl_to_faces_json(stl_bytes: bytes):
             pts = [{"x": float((p[0] - min_x) * scale), "y": float((p[1] - min_y) * scale)} for p in loop]
             out_loops.append({"idx": idx, "closed": True, "points": pts})
 
-        # 7) Largest area loop is outer
+        # 8) Drop microscopic loops (noise)
         def poly_area(pts):
             area2 = 0.0
             for i in range(len(pts) - 1):
                 area2 += pts[i]["x"] * pts[i + 1]["y"] - pts[i + 1]["x"] * pts[i]["y"]
             return abs(area2) * 0.5
 
-        outer_idx = max(range(len(out_loops)), key=lambda i: poly_area(out_loops[i]["points"]))
+        min_area_in2 = (STL_HEAL_TOL_IN * STL_HEAL_TOL_IN) * 4.0  # conservative
+        filtered = []
+        for l in out_loops:
+            if poly_area(l["points"]) >= min_area_in2:
+                filtered.append(l)
 
-        return {"units": "in", "outerLoopIndex": int(outer_idx), "loops": out_loops}
+        if not filtered:
+            filtered = out_loops
+
+        # 9) Largest area loop is outer
+        outer_idx = max(range(len(filtered)), key=lambda i: poly_area(filtered[i]["points"]))
+
+        return {"units": "in", "outerLoopIndex": int(outer_idx), "loops": filtered}
 
     finally:
         try:
