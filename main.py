@@ -51,6 +51,7 @@ import tempfile
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field, validator
 import cadquery as cq
+from stl import mesh as stlmesh
 
 INCH_TO_MM = 25.4
 
@@ -481,62 +482,66 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
     return solid
 
 
+def _convex_hull_2d(points):
+    """
+    Monotonic chain convex hull.
+    points: list of (x,y)
+    returns hull list in CCW order without repeating first point
+    """
+    pts = sorted(set(points))
+    if len(pts) <= 1:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+
+    return lower[:-1] + upper[:-1]
+
+
 def stl_to_faces_json(stl_bytes: bytes):
     """
-    Load STL and return a Forge-style faces_json object:
-      {
-        "units": "in",
-        "outerLoopIndex": 0,
-        "loops": [
-          { "idx": 0, "closed": True, "points": [{"x":..,"y":..}, ...] }
-        ]
-      }
+    STL -> faces_json using a robust triangle-vertex projection.
 
-    Path A (minimal):
-    - Import STL into CadQuery
-    - Project to XY plane to get silhouette wires
-    - Pick the largest closed wire as the outer loop
-    - Discretize to points
-    - Output raw XY as inches (unitless STL => treat as inches)
+    Path A:
+    - Load STL triangles with numpy-stl
+    - Project all vertices to XY
+    - Compute convex hull as a single closed outer loop
+    - Treat units as inches (STL is unitless)
     """
     with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as tmp:
         stl_path = tmp.name
         tmp.write(stl_bytes)
 
     try:
-        shape = cq.importers.importShape("mesh", stl_path)
-        wp = cq.Workplane("XY").add(shape)
+        m = stlmesh.Mesh.from_file(stl_path)
 
-        proj = wp.projectToPlane(plane="XY")
-        wires = proj.wires().vals()
-        if not wires:
-            raise ValueError("No silhouette wires produced from STL projection")
+        # m.vectors shape: (n, 3, 3) => triangles, vertices, xyz
+        vecs = m.vectors.reshape(-1, 3)  # (n*3, 3)
+        if vecs.size == 0:
+            raise ValueError("STL contains no vertices")
 
-        best = None
-        best_area = -1.0
+        pts2 = [(float(v[0]), float(v[1])) for v in vecs]
 
-        for w in wires:
-            try:
-                if not w.IsClosed():
-                    continue
-                area = abs(cq.Shape(w).Area())
-                if area > best_area:
-                    best_area = area
-                    best = w
-            except Exception:
-                continue
+        hull = _convex_hull_2d(pts2)
+        if not hull or len(hull) < 3:
+            raise ValueError("Convex hull too small (need >= 3 points)")
 
-        if best is None:
-            raise ValueError("No closed silhouette wire found from STL projection")
+        out_pts = [{"x": float(x), "y": float(y)} for (x, y) in hull]
 
-        pts = cq.Shape(best).Edges().val().discretize(240)
-        if not pts or len(pts) < 3:
-            raise ValueError("Silhouette discretize produced too few points")
-
-        out_pts = [{"x": float(p.x), "y": float(p.y)} for p in pts]
-
-        if out_pts[0]["x"] != out_pts[-1]["x"] or out_pts[0]["y"] != out_pts[-1]["y"]:
-            out_pts.append(out_pts[0])
+        # Close the loop
+        out_pts.append(out_pts[0])
 
         return {
             "units": "in",
@@ -554,6 +559,7 @@ def stl_to_faces_json(stl_bytes: bytes):
             os.remove(stl_path)
         except OSError:
             pass
+
 
 
 def export_step_text(solid: cq.Workplane) -> str:
