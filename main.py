@@ -496,7 +496,9 @@ def stl_to_faces_json(stl_bytes: bytes):
     STL → faces_json extraction (top-face boundary edges) with:
     - Corner healing via vertex snapping (tolerance grid)
     - Reduced tolerance (1/64") to avoid collapsing small cavities
-    - Angle-based loop walking to follow non-rectangular cavity shapes better
+    - Angle-based loop walking
+    - NEW: loop canonicalization + de-duplication (prevents stacked cavities)
+    - NEW: outerLoopIndex computed AFTER filtering/deduping (prevents outer being treated as a cavity)
     """
     from collections import defaultdict
     import math
@@ -557,8 +559,8 @@ def stl_to_faces_json(stl_bytes: bytes):
         if not (tol_native > 0.0):
             tol_native = 1e-6
 
-        # Be less aggressive dropping edges (previously tol/2 was too harsh for small cavities)
-        min_edge = 0.2 * tol_native
+        # Drop only truly tiny edges (keep small features)
+        min_edge = 0.15 * tol_native
 
         # 4) Count edges; boundary edges appear once (with snapping/healing)
         edge_count = defaultdict(int)
@@ -610,19 +612,17 @@ def stl_to_faces_json(stl_bytes: bytes):
             adj[a].append(b)
             adj[b].append(a)
 
-        # 6) Angle-based loop walking (better for non-rect shapes / junctions)
+        # 6) Angle-based loop walking
         used_dir = set()
 
         def dir_id(p, q):
             return (p, q)
 
         def turn_angle(prev_pt, cur_pt, nxt_pt):
-            # returns angle in [0, 2pi): smaller means "straighter / slight left"
             ax = cur_pt[0] - prev_pt[0]
             ay = cur_pt[1] - prev_pt[1]
             bx = nxt_pt[0] - cur_pt[0]
             by = nxt_pt[1] - cur_pt[1]
-            # cross and dot
             cross = ax * by - ay * bx
             dot = ax * bx + ay * by
             ang = math.atan2(cross, dot)
@@ -630,7 +630,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                 ang += 2.0 * math.pi
             return ang
 
-        loops = []
+        loops_native = []
         max_steps = max(1000, len(boundary_edges) * 2)
 
         for start in list(adj.keys()):
@@ -651,12 +651,10 @@ def stl_to_faces_json(stl_bytes: bytes):
                     if not nbrs:
                         break
 
-                    # Candidate next points excluding immediate backtrack when possible
                     cands = [p for p in nbrs if p != prev]
                     if not cands:
-                        cands = [prev]  # forced backtrack
+                        cands = [prev]
 
-                    # Choose next by smallest turning angle from incoming segment
                     best = None
                     best_ang = None
                     for cand in cands:
@@ -679,41 +677,107 @@ def stl_to_faces_json(stl_bytes: bytes):
                         break
 
                 if len(loop) >= 4 and loop[0] == loop[-1]:
-                    loops.append(loop)
+                    loops_native.append(loop)
 
-        if not loops:
+        if not loops_native:
             raise ValueError("Failed to assemble loops from boundary edges")
 
-        # 7) Shift to (0,0) and scale to inches
-        xs = [p[0] for loop in loops for p in loop]
-        ys = [p[1] for loop in loops for p in loop]
+        # --- helpers for area + canonicalization + dedupe (in inches coordinates) ---
+        def poly_area_xy(pts_xy):
+            # pts_xy is list of (x,y) with closure optional
+            if len(pts_xy) < 3:
+                return 0.0
+            if pts_xy[0] == pts_xy[-1]:
+                pts = pts_xy
+            else:
+                pts = pts_xy + [pts_xy[0]]
+            a2 = 0.0
+            for i in range(len(pts) - 1):
+                a2 += pts[i][0] * pts[i + 1][1] - pts[i + 1][0] * pts[i][1]
+            return abs(a2) * 0.5
+
+        def canonicalize_loop(pts_xy):
+            # remove duplicate end if present
+            pts = pts_xy[:-1] if (len(pts_xy) > 1 and pts_xy[0] == pts_xy[-1]) else list(pts_xy)
+            if len(pts) < 3:
+                return pts_xy
+
+            # rotate so the smallest (x,y) lexicographically is first
+            def rotate_to_min(seq):
+                mi = min(range(len(seq)), key=lambda i: (seq[i][0], seq[i][1]))
+                return seq[mi:] + seq[:mi]
+
+            fwd = rotate_to_min(pts)
+            rev = rotate_to_min(list(reversed(pts)))
+
+            # choose lexicographically smaller representation for stable dedupe
+            rep_fwd = tuple((round(x, 6), round(y, 6)) for (x, y) in fwd)
+            rep_rev = tuple((round(x, 6), round(y, 6)) for (x, y) in rev)
+            chosen = fwd if rep_fwd <= rep_rev else rev
+
+            # re-close
+            return chosen + [chosen[0]]
+
+        # 7) Shift to (0,0) (native), then scale to inches
+        xs = [p[0] for loop in loops_native for p in loop]
+        ys = [p[1] for loop in loops_native for p in loop]
         min_x, min_y = min(xs), min(ys)
 
+        loops_in = []
+        for loop in loops_native:
+            pts_in = [((p[0] - min_x) * scale, (p[1] - min_y) * scale) for p in loop]
+            loops_in.append(pts_in)
+
+        # 8) Canonicalize + de-dup loops
+        dedup_map = {}  # signature -> pts_in
+        for pts_in in loops_in:
+            can = canonicalize_loop(pts_in)
+            if len(can) < 4 or can[0] != can[-1]:
+                continue
+
+            xs2 = [p[0] for p in can]
+            ys2 = [p[1] for p in can]
+            bbox = (min(xs2), min(ys2), max(xs2), max(ys2))
+            area = poly_area_xy(can)
+
+            # signature: bbox + area + vertex count, with rounding
+            sig = (
+                round(bbox[0], 5),
+                round(bbox[1], 5),
+                round(bbox[2], 5),
+                round(bbox[3], 5),
+                round(area, 6),
+                len(can),
+            )
+
+            # keep the larger-area loop if collision (rare, but safe)
+            if sig in dedup_map:
+                if area > poly_area_xy(dedup_map[sig]):
+                    dedup_map[sig] = can
+            else:
+                dedup_map[sig] = can
+
+        loops_can = list(dedup_map.values())
+        if not loops_can:
+            raise ValueError("No valid loops after dedupe")
+
+        # 9) Drop microscopic loops (noise) — LESS aggressive to avoid losing cavities
+        min_area_in2 = (STL_HEAL_TOL_IN * STL_HEAL_TOL_IN) * 0.10
+        filtered = [l for l in loops_can if poly_area_xy(l) >= min_area_in2]
+        if not filtered:
+            filtered = loops_can
+
+        # 10) Choose outer as largest area AFTER dedupe/filtering
+        areas = [poly_area_xy(l) for l in filtered]
+        outer_idx = int(max(range(len(filtered)), key=lambda i: areas[i]))
+
+        # 11) Emit faces_json with plain Python floats
         out_loops = []
-        for idx, loop in enumerate(loops):
-            pts = [{"x": float((p[0] - min_x) * scale), "y": float((p[1] - min_y) * scale)} for p in loop]
+        for idx, loop in enumerate(filtered):
+            pts = [{"x": float(p[0]), "y": float(p[1])} for p in loop]
             out_loops.append({"idx": idx, "closed": True, "points": pts})
 
-        # 8) Drop microscopic loops (noise)
-        def poly_area(pts):
-            area2 = 0.0
-            for i in range(len(pts) - 1):
-                area2 += pts[i]["x"] * pts[i + 1]["y"] - pts[i + 1]["x"] * pts[i]["y"]
-            return abs(area2) * 0.5
-
-        min_area_in2 = (STL_HEAL_TOL_IN * STL_HEAL_TOL_IN) * 4.0  # conservative
-        filtered = []
-        for l in out_loops:
-            if poly_area(l["points"]) >= min_area_in2:
-                filtered.append(l)
-
-        if not filtered:
-            filtered = out_loops
-
-        # 9) Largest area loop is outer
-        outer_idx = max(range(len(filtered)), key=lambda i: poly_area(filtered[i]["points"]))
-
-        return {"units": "in", "outerLoopIndex": int(outer_idx), "loops": filtered}
+        return {"units": "in", "outerLoopIndex": outer_idx, "loops": out_loops}
 
     finally:
         try:
