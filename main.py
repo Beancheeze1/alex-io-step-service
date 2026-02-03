@@ -512,17 +512,21 @@ def _convex_hull_2d(points):
 
 def stl_to_faces_json(stl_bytes: bytes):
     """
-    STL -> faces_json using a robust triangle-vertex projection.
+    Forge-equivalent STL → faces_json extraction.
 
-    Path A (updated):
-    - Load STL triangles with numpy-stl
-    - Project all vertices to XY
-    - Compute convex hull as a single closed outer loop
-    - STL is unitless, so we detect scale from the XY bounding box:
-        - If bbox looks "too large" to be inches, assume mm and convert to inches
-    - Shift result so min X/Y == 0 (prevents off-canvas due to negative coords)
-    - Return units="in" (schema unchanged)
+    Strategy:
+    - Parse STL triangles
+    - Detect top-facing triangles
+    - Group by coplanar Z
+    - Choose largest top surface
+    - Extract boundary edges (edges used once)
+    - Build closed loops (outer + holes)
+    - Auto-scale mm → inches when necessary
     """
+
+    import math
+    from collections import defaultdict
+
     with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as tmp:
         stl_path = tmp.name
         tmp.write(stl_bytes)
@@ -530,64 +534,118 @@ def stl_to_faces_json(stl_bytes: bytes):
     try:
         m = stlmesh.Mesh.from_file(stl_path)
 
-        # m.vectors shape: (n, 3, 3) => triangles, vertices, xyz
-        vecs = m.vectors.reshape(-1, 3)  # (n*3, 3)
-        if vecs.size == 0:
-            raise ValueError("STL contains no vertices")
+        tris = m.vectors  # (n, 3, 3)
 
-        # Pull XY
-        xs = [float(v[0]) for v in vecs]
-        ys = [float(v[1]) for v in vecs]
+        # --- STEP 1: Find top-facing triangles ---
+        top_tris = []
+        for tri in tris:
+            v1, v2, v3 = tri
+            ux, uy, uz = v2 - v1
+            vx, vy, vz = v3 - v1
+            nx = uy * vz - uz * vy
+            ny = uz * vx - ux * vz
+            nz = ux * vy - uy * vx
+            if nz > 0:
+                top_tris.append(tri)
 
-        min_x = min(xs)
-        max_x = max(xs)
-        min_y = min(ys)
-        max_y = max(ys)
+        if not top_tris:
+            raise ValueError("No upward-facing triangles found")
 
-        span_x = max_x - min_x
-        span_y = max_y - min_y
-        span_max = max(span_x, span_y)
+        # --- STEP 2: Group triangles by Z plane ---
+        planes = defaultdict(list)
+        for tri in top_tris:
+            z = round(float((tri[0][2] + tri[1][2] + tri[2][2]) / 3.0), 4)
+            planes[z].append(tri)
 
-        if span_max <= 0:
-            raise ValueError("STL XY bounding box is degenerate (zero area)")
+        # --- STEP 3: Choose largest plane ---
+        def tri_area(t):
+            a, b, c = t
+            return abs(
+                (b[0]-a[0])*(c[1]-a[1]) -
+                (b[1]-a[1])*(c[0]-a[0])
+            ) * 0.5
 
-        # Heuristic:
-        # - If the XY span is huge, it's almost certainly mm being interpreted as inches.
-        # - Keep it conservative: only auto-convert when it's clearly not inches.
-        #
-        # Example: a 26" part exported in mm is ~660 units wide -> triggers conversion.
-        assume_mm = span_max > 120.0  # inches > 120 is extremely unlikely for this use-case
+        plane_tris = max(planes.values(), key=lambda lst: sum(tri_area(t) for t in lst))
 
+        # --- STEP 4: Build edge map ---
+        edge_count = defaultdict(int)
+        def edge_key(a, b):
+            return tuple(sorted((
+                (round(a[0],5), round(a[1],5)),
+                (round(b[0],5), round(b[1],5))
+            )))
+
+        for tri in plane_tris:
+            pts = [(p[0], p[1]) for p in tri]
+            for i in range(3):
+                e = edge_key(pts[i], pts[(i+1)%3])
+                edge_count[e] += 1
+
+        # --- STEP 5: Boundary edges ---
+        boundary_edges = [e for e,c in edge_count.items() if c == 1]
+
+        # --- STEP 6: Build loops ---
+        loops = []
+        while boundary_edges:
+            start = boundary_edges.pop()
+            loop = [start[0], start[1]]
+            changed = True
+            while changed:
+                changed = False
+                for e in list(boundary_edges):
+                    if e[0] == loop[-1]:
+                        loop.append(e[1])
+                        boundary_edges.remove(e)
+                        changed = True
+                    elif e[1] == loop[-1]:
+                        loop.append(e[0])
+                        boundary_edges.remove(e)
+                        changed = True
+            loops.append(loop)
+
+        if not loops:
+            raise ValueError("No loops extracted")
+
+        # --- STEP 7: Scale detection ---
+        xs = [p[0] for loop in loops for p in loop]
+        ys = [p[1] for loop in loops for p in loop]
+        span = max(max(xs)-min(xs), max(ys)-min(ys))
+        assume_mm = span > 120
         scale = (1.0 / INCH_TO_MM) if assume_mm else 1.0
 
-        # Scale + shift to (0,0)
-        pts2 = [((float(v[0]) - min_x) * scale, (float(v[1]) - min_y) * scale) for v in vecs]
+        min_x, min_y = min(xs), min(ys)
 
-        hull = _convex_hull_2d(pts2)
-        if not hull or len(hull) < 3:
-            raise ValueError("Convex hull too small (need >= 3 points)")
+        # --- STEP 8: Format faces_json ---
+        out_loops = []
+        for idx, loop in enumerate(loops):
+            pts = [{"x": (x-min_x)*scale, "y": (y-min_y)*scale} for (x,y) in loop]
+            pts.append(pts[0])
+            out_loops.append({
+                "idx": idx,
+                "closed": True,
+                "points": pts
+            })
 
-        out_pts = [{"x": float(x), "y": float(y)} for (x, y) in hull]
+        # largest area = outer
+        def poly_area(pts):
+            return abs(sum(
+                pts[i]["x"] * pts[(i+1)%len(pts)]["y"] -
+                pts[(i+1)%len(pts)]["x"] * pts[i]["y"]
+                for i in range(len(pts)-1)
+            )) / 2
 
-        # Close the loop
-        out_pts.append(out_pts[0])
+        outer_idx = max(range(len(out_loops)), key=lambda i: poly_area(out_loops[i]["points"]))
 
         return {
             "units": "in",
-            "outerLoopIndex": 0,
-            "loops": [
-                {
-                    "idx": 0,
-                    "closed": True,
-                    "points": out_pts,
-                }
-            ],
+            "outerLoopIndex": outer_idx,
+            "loops": out_loops,
         }
+
     finally:
-        try:
-            os.remove(stl_path)
-        except OSError:
-            pass
+        try: os.remove(stl_path)
+        except OSError: pass
+
 
 
 def export_step_text(solid: cq.Workplane) -> str:
