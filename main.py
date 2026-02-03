@@ -238,7 +238,6 @@ def build_layer_block(
       - Else if cropped: chamfer two corners (UL and LR) using polygon profile
       - Else: square box
     """
-    # Always start from a square base in the correct coordinate system
     def _square():
         return (
             cq.Workplane("XY")
@@ -246,7 +245,6 @@ def build_layer_block(
             .translate((0, 0, z))
         )
 
-    # Rounded outer corners (takes precedence over crop)
     if rounded:
         r = float(radius_mm) if radius_mm else 0.0
         if r > 0:
@@ -258,7 +256,6 @@ def build_layer_block(
 
         if r > 0:
             try:
-                # Build square block at (0,0) then fillet vertical edges only
                 solid = (
                     cq.Workplane("XY")
                     .box(L_mm, W_mm, T_mm, centered=(False, False, False))
@@ -266,21 +263,16 @@ def build_layer_block(
                     .fillet(r)
                     .translate((0, 0, z))
                 )
-                # Ensure we still have a solid; otherwise fallback
                 if solid.val().Solids():
                     return solid
             except Exception:
-                # SAFE fallback
                 return _square()
 
-        # If radius invalid/zero, just return square
         return _square()
 
-    # Square block
     if not cropped:
         return _square()
 
-    # Cropped corners (existing behavior)
     c = float(chamfer_mm)
     if not (c > 0):
         c = 1.0 * INCH_TO_MM
@@ -288,9 +280,6 @@ def build_layer_block(
     if L_mm <= 2.0 * c or W_mm <= 2.0 * c:
         return _square()
 
-    # Polygon with chamfers at:
-    #  - LR corner (L,0) => (L-c,0) -> (L,c)
-    #  - UL corner (0,W) => (0,W-c) -> (c,W)
     pts = [
         (0.0, 0.0),
         (L_mm - c, 0.0),
@@ -345,13 +334,8 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
         )
         working = base
 
-        # IMPORTANT: per-layer STEP must only use per-layer cavities.
         cavities = list(layer.cavities or [])
 
-        # Compute effective depth used for ordering:
-        # - shallow first
-        # - deep last
-        # - through-cuts treated as "deepest"
         def _eff_depth_mm(c: Cavity) -> float:
             try:
                 d_mm = float(c.depthIn) * INCH_TO_MM
@@ -366,9 +350,6 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
         cavities.sort(key=_eff_depth_mm)
 
         for cav in cavities:
-            # Determine cut depth:
-            # - Through-cut if requested depth >= thickness
-            # - Else legacy blind pocket clamp
             try:
                 req_mm = float(cav.depthIn) * INCH_TO_MM
             except Exception:
@@ -392,7 +373,6 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
                     dia_mm = float(dia_in) * INCH_TO_MM
                     r_mm = dia_mm / 2.0
 
-                    # Convert editor top-left normalized coords -> CAD bottom-left coords
                     x_left = cav.x * L_mm
                     y_top_cad = W_mm * (1.0 - cav.y) - (2.0 * r_mm)
 
@@ -418,14 +398,11 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
                         continue
 
                     x_left = cav.x * L_mm
-
-                    # Flip Y: CAD bottom-left origin (editor uses top-left)
                     y_top_cad = W_mm * (1.0 - cav.y) - cav_W
 
                     x_left = max(0.0, min(L_mm - cav_L, x_left))
                     y_top_cad = max(0.0, min(W_mm - cav_W, y_top_cad))
 
-                    # Rounded-rect pocket if radius is present and sane
                     r_mm = 0.0
                     if corner_r_in is not None and corner_r_in > 0:
                         r_mm = float(corner_r_in) * INCH_TO_MM
@@ -514,17 +491,10 @@ def stl_to_faces_json(stl_bytes: bytes):
     """
     Forge-equivalent STL → faces_json extraction.
 
-    Strategy:
-    - Parse STL triangles
-    - Detect top-facing triangles
-    - Group by coplanar Z
-    - Choose largest top surface
-    - Extract boundary edges (edges used once)
-    - Build closed loops (outer + holes)
-    - Auto-scale mm → inches when necessary
+    Key fix:
+    - Ensure all returned numbers are plain Python float (no numpy.float32),
+      so FastAPI can JSON-encode the response.
     """
-
-    import math
     from collections import defaultdict
 
     with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as tmp:
@@ -533,119 +503,156 @@ def stl_to_faces_json(stl_bytes: bytes):
 
     try:
         m = stlmesh.Mesh.from_file(stl_path)
+        tris = m.vectors  # (n, 3, 3) numpy floats
 
-        tris = m.vectors  # (n, 3, 3)
-
-        # --- STEP 1: Find top-facing triangles ---
+        # 1) Upward-facing triangles
         top_tris = []
         for tri in tris:
             v1, v2, v3 = tri
             ux, uy, uz = v2 - v1
             vx, vy, vz = v3 - v1
-            nx = uy * vz - uz * vy
-            ny = uz * vx - ux * vz
-            nz = ux * vy - uy * vx
-            if nz > 0:
+            nz = ux * vy - uy * vx  # z-component of cross product
+            if float(nz) > 0.0:
                 top_tris.append(tri)
 
         if not top_tris:
             raise ValueError("No upward-facing triangles found")
 
-        # --- STEP 2: Group triangles by Z plane ---
+        # 2) Group by Z plane (coplanar-ish)
         planes = defaultdict(list)
         for tri in top_tris:
-            z = round(float((tri[0][2] + tri[1][2] + tri[2][2]) / 3.0), 4)
-            planes[z].append(tri)
+            z = float((tri[0][2] + tri[1][2] + tri[2][2]) / 3.0)
+            planes[round(z, 4)].append(tri)
 
-        # --- STEP 3: Choose largest plane ---
+        # 3) Choose largest plane by projected XY area
         def tri_area(t):
             a, b, c = t
-            return abs(
-                (b[0]-a[0])*(c[1]-a[1]) -
-                (b[1]-a[1])*(c[0]-a[0])
-            ) * 0.5
+            ax, ay = float(a[0]), float(a[1])
+            bx, by = float(b[0]), float(b[1])
+            cx, cy = float(c[0]), float(c[1])
+            return abs((bx - ax) * (cy - ay) - (by - ay) * (cx - ax)) * 0.5
 
         plane_tris = max(planes.values(), key=lambda lst: sum(tri_area(t) for t in lst))
 
-        # --- STEP 4: Build edge map ---
+        # 4) Count edges; boundary edges appear once
         edge_count = defaultdict(int)
+
         def edge_key(a, b):
-            return tuple(sorted((
-                (round(a[0],5), round(a[1],5)),
-                (round(b[0],5), round(b[1],5))
-            )))
+            ax, ay = float(a[0]), float(a[1])
+            bx, by = float(b[0]), float(b[1])
+            p1 = (round(ax, 5), round(ay, 5))
+            p2 = (round(bx, 5), round(by, 5))
+            return tuple(sorted((p1, p2)))
 
         for tri in plane_tris:
-            pts = [(p[0], p[1]) for p in tri]
+            pts = [
+                (tri[0][0], tri[0][1]),
+                (tri[1][0], tri[1][1]),
+                (tri[2][0], tri[2][1]),
+            ]
             for i in range(3):
-                e = edge_key(pts[i], pts[(i+1)%3])
+                e = edge_key(pts[i], pts[(i + 1) % 3])
                 edge_count[e] += 1
 
-        # --- STEP 5: Boundary edges ---
-        boundary_edges = [e for e,c in edge_count.items() if c == 1]
+        boundary_edges = [e for e, c in edge_count.items() if c == 1]
+        if not boundary_edges:
+            raise ValueError("No boundary edges found on selected top plane")
 
-        # --- STEP 6: Build loops ---
+        # 5) Assemble loops from boundary edge graph
+        from collections import defaultdict as _dd
+
+        adj = _dd(list)
+        for a, b in boundary_edges:
+            adj[a].append(b)
+            adj[b].append(a)
+
+        used = set()
+
+        def edge_id(p, q):
+            return tuple(sorted((p, q)))
+
         loops = []
-        while boundary_edges:
-            start = boundary_edges.pop()
-            loop = [start[0], start[1]]
-            changed = True
-            while changed:
-                changed = False
-                for e in list(boundary_edges):
-                    if e[0] == loop[-1]:
-                        loop.append(e[1])
-                        boundary_edges.remove(e)
-                        changed = True
-                    elif e[1] == loop[-1]:
-                        loop.append(e[0])
-                        boundary_edges.remove(e)
-                        changed = True
-            loops.append(loop)
+
+        for start in list(adj.keys()):
+            for nxt in adj[start]:
+                eid = edge_id(start, nxt)
+                if eid in used:
+                    continue
+
+                loop = [start]
+                prev = None
+                cur = start
+                neighbor = nxt
+
+                while True:
+                    used.add(edge_id(cur, neighbor))
+                    loop.append(neighbor)
+
+                    prev, cur = cur, neighbor
+                    nbs = adj[cur]
+
+                    cand = None
+                    for nn in nbs:
+                        if nn == prev:
+                            continue
+                        if edge_id(cur, nn) not in used:
+                            cand = nn
+                            break
+
+                    if cand is None:
+                        if cur == start:
+                            break
+                        for nn in nbs:
+                            if nn != prev:
+                                cand = nn
+                                break
+
+                    if cand is None:
+                        break
+
+                    neighbor = cand
+                    if neighbor == start:
+                        used.add(edge_id(cur, neighbor))
+                        loop.append(start)
+                        break
+
+                if len(loop) >= 4 and loop[0] == loop[-1]:
+                    loops.append(loop)
 
         if not loops:
-            raise ValueError("No loops extracted")
+            raise ValueError("Failed to assemble loops from boundary edges")
 
-        # --- STEP 7: Scale detection ---
+        # 6) Scale detection + shift to (0,0)
         xs = [p[0] for loop in loops for p in loop]
         ys = [p[1] for loop in loops for p in loop]
-        span = max(max(xs)-min(xs), max(ys)-min(ys))
-        assume_mm = span > 120
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        span = max(max_x - min_x, max_y - min_y)
+
+        assume_mm = float(span) > 120.0
         scale = (1.0 / INCH_TO_MM) if assume_mm else 1.0
 
-        min_x, min_y = min(xs), min(ys)
-
-        # --- STEP 8: Format faces_json ---
         out_loops = []
         for idx, loop in enumerate(loops):
-            pts = [{"x": (x-min_x)*scale, "y": (y-min_y)*scale} for (x,y) in loop]
-            pts.append(pts[0])
-            out_loops.append({
-                "idx": idx,
-                "closed": True,
-                "points": pts
-            })
+            pts = [{"x": float((p[0] - min_x) * scale), "y": float((p[1] - min_y) * scale)} for p in loop]
+            out_loops.append({"idx": idx, "closed": True, "points": pts})
 
-        # largest area = outer
+        # 7) Largest area loop is outer
         def poly_area(pts):
-            return abs(sum(
-                pts[i]["x"] * pts[(i+1)%len(pts)]["y"] -
-                pts[(i+1)%len(pts)]["x"] * pts[i]["y"]
-                for i in range(len(pts)-1)
-            )) / 2
+            area2 = 0.0
+            for i in range(len(pts) - 1):
+                area2 += pts[i]["x"] * pts[i + 1]["y"] - pts[i + 1]["x"] * pts[i]["y"]
+            return abs(area2) * 0.5
 
         outer_idx = max(range(len(out_loops)), key=lambda i: poly_area(out_loops[i]["points"]))
 
-        return {
-            "units": "in",
-            "outerLoopIndex": outer_idx,
-            "loops": out_loops,
-        }
+        return {"units": "in", "outerLoopIndex": int(outer_idx), "loops": out_loops}
 
     finally:
-        try: os.remove(stl_path)
-        except OSError: pass
-
+        try:
+            os.remove(stl_path)
+        except OSError:
+            pass
 
 
 def export_step_text(solid: cq.Workplane) -> str:
