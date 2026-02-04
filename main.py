@@ -499,6 +499,10 @@ def stl_to_faces_json(stl_bytes: bytes):
     - Angle-based loop walking
     - Loop canonicalization + de-duplication (prevents stacked cavities)
     - outerLoopIndex computed AFTER filtering/deduping (prevents outer being treated as a cavity)
+
+    NEW (Path A): Region-boundary edges (per connected triangle region on top plane)
+      - Fixes missing "compound" cavities whose perimeter was fragmented by global edge counts.
+      - We still emit each closed loop independently (overlay cavities are allowed in editor).
     """
     from collections import defaultdict
     import math
@@ -562,8 +566,7 @@ def stl_to_faces_json(stl_bytes: bytes):
         # Drop only truly tiny edges (keep small features)
         min_edge = 0.15 * tol_native
 
-        # 4) Count edges; boundary edges appear once (with snapping/healing)
-        edge_count = defaultdict(int)
+        # --- snapping / edge key helpers (native units) ---
         canon = {}
 
         def snap_xy(x, y):
@@ -588,36 +591,69 @@ def stl_to_faces_json(stl_bytes: bytes):
             p2 = (float(bx), float(by))
             return tuple(sorted((p1, p2)))
 
+        # 4) Build triangle list (snapped XY) + triangle-edge map (for region connectivity)
+        tri_pts = []     # list[tuple[p0,p1,p2]] where pi=(x,y) snapped
+        tri_edges = []   # list[list[edge_key]] edges per triangle (None filtered out)
+        edge_to_tris = defaultdict(list)  # edge_key -> [tri_index...]
+
         for tri in plane_tris:
             pts = [
                 (tri[0][0], tri[0][1]),
                 (tri[1][0], tri[1][1]),
                 (tri[2][0], tri[2][1]),
             ]
+            # snap vertices themselves so connectivity is stable
+            sp = [snap_xy(p[0], p[1]) for p in pts]
+            tri_pts.append((sp[0], sp[1], sp[2]))
+
+            edges = []
             for i in range(3):
                 e = edge_key(pts[i], pts[(i + 1) % 3])
                 if e is None:
                     continue
-                edge_count[e] += 1
+                edges.append(e)
+                edge_to_tris[e].append(len(tri_pts) - 1)
+            tri_edges.append(edges)
 
-        boundary_edges = [e for e, c in edge_count.items() if c == 1]
-        if not boundary_edges:
-            raise ValueError("No boundary edges found on selected top plane")
+        if not tri_pts:
+            raise ValueError("No triangles on selected top plane")
 
-        # 5) Build adjacency
-        from collections import defaultdict as _dd
+        # 5) Connected components of triangles on the top plane
+        # Two triangles are adjacent if they share an edge (after snapping).
+        adj_tris = [[] for _ in range(len(tri_pts))]
+        for e, idxs in edge_to_tris.items():
+            if len(idxs) < 2:
+                continue
+            # connect all triangles that share this edge
+            for i in range(len(idxs)):
+                a = idxs[i]
+                for j in range(i + 1, len(idxs)):
+                    b = idxs[j]
+                    adj_tris[a].append(b)
+                    adj_tris[b].append(a)
 
-        adj = _dd(list)
-        for a, b in boundary_edges:
-            adj[a].append(b)
-            adj[b].append(a)
+        seen = [False] * len(tri_pts)
+        components = []
+        for i in range(len(tri_pts)):
+            if seen[i]:
+                continue
+            stack = [i]
+            seen[i] = True
+            comp = []
+            while stack:
+                t = stack.pop()
+                comp.append(t)
+                for nb in adj_tris[t]:
+                    if not seen[nb]:
+                        seen[nb] = True
+                        stack.append(nb)
+            components.append(comp)
 
-        # 6) Angle-based loop walking
-        used_dir = set()
+        if not components:
+            raise ValueError("No connected triangle regions found")
 
-        def dir_id(p, q):
-            return (p, q)
-
+        # 6) For each component, compute boundary edges = edges with count==1 within THAT component
+        # Then loop-walk on those boundary edges.
         def turn_angle(prev_pt, cur_pt, nxt_pt):
             ax = cur_pt[0] - prev_pt[0]
             ay = cur_pt[1] - prev_pt[1]
@@ -630,61 +666,82 @@ def stl_to_faces_json(stl_bytes: bytes):
                 ang += 2.0 * math.pi
             return ang
 
-        loops_native = []
-        max_steps = max(1000, len(boundary_edges) * 2)
+        loops_native_all = []
 
-        for start in list(adj.keys()):
-            for nxt in adj[start]:
-                if dir_id(start, nxt) in used_dir:
-                    continue
+        for comp in components:
+            edge_count = defaultdict(int)
+            for ti in comp:
+                for e in tri_edges[ti]:
+                    edge_count[e] += 1
 
-                loop = [start, nxt]
-                used_dir.add(dir_id(start, nxt))
+            boundary_edges = [e for e, c in edge_count.items() if c == 1]
+            if not boundary_edges:
+                continue
 
-                prev = start
-                cur = nxt
+            # adjacency of boundary edges (vertex graph)
+            adj = defaultdict(list)
+            for a, b in boundary_edges:
+                adj[a].append(b)
+                adj[b].append(a)
 
-                steps = 0
-                while steps < max_steps:
-                    steps += 1
-                    nbrs = adj[cur]
-                    if not nbrs:
-                        break
+            used_dir = set()
 
-                    cands = [p for p in nbrs if p != prev]
-                    if not cands:
-                        cands = [prev]
+            def dir_id(p, q):
+                return (p, q)
 
-                    best = None
-                    best_ang = None
-                    for cand in cands:
-                        if dir_id(cur, cand) in used_dir:
-                            continue
-                        ang = turn_angle(prev, cur, cand)
-                        if best is None or ang < best_ang:
-                            best = cand
-                            best_ang = ang
+            max_steps = max(1000, len(boundary_edges) * 2)
 
-                    if best is None:
-                        break
+            for start in list(adj.keys()):
+                for nxt in adj[start]:
+                    if dir_id(start, nxt) in used_dir:
+                        continue
 
-                    used_dir.add(dir_id(cur, best))
-                    loop.append(best)
+                    loop = [start, nxt]
+                    used_dir.add(dir_id(start, nxt))
 
-                    prev, cur = cur, best
+                    prev = start
+                    cur = nxt
 
-                    if cur == start:
-                        break
+                    steps = 0
+                    while steps < max_steps:
+                        steps += 1
+                        nbrs = adj[cur]
+                        if not nbrs:
+                            break
 
-                if len(loop) >= 4 and loop[0] == loop[-1]:
-                    loops_native.append(loop)
+                        cands = [p for p in nbrs if p != prev]
+                        if not cands:
+                            cands = [prev]
 
-        if not loops_native:
-            raise ValueError("Failed to assemble loops from boundary edges")
+                        best = None
+                        best_ang = None
+                        for cand in cands:
+                            if dir_id(cur, cand) in used_dir:
+                                continue
+                            ang = turn_angle(prev, cur, cand)
+                            if best is None or ang < best_ang:
+                                best = cand
+                                best_ang = ang
+
+                        if best is None:
+                            break
+
+                        used_dir.add(dir_id(cur, best))
+                        loop.append(best)
+
+                        prev, cur = cur, best
+
+                        if cur == start:
+                            break
+
+                    if len(loop) >= 4 and loop[0] == loop[-1]:
+                        loops_native_all.append(loop)
+
+        if not loops_native_all:
+            raise ValueError("Failed to assemble loops from region boundary edges")
 
         # --- helpers for area + canonicalization + dedupe (in inches coordinates) ---
         def poly_area_xy(pts_xy):
-            # pts_xy is list of (x,y) with closure optional
             if len(pts_xy) < 3:
                 return 0.0
             pts = pts_xy
@@ -705,7 +762,6 @@ def stl_to_faces_json(stl_bytes: bytes):
             if len(pts_xy) < 4:
                 return pts_xy
 
-            # remove trailing closure for canonical work
             pts = pts_xy[:-1] if pts_xy[0] == pts_xy[-1] else list(pts_xy)
             if len(pts) < 3:
                 return pts_xy
@@ -724,17 +780,16 @@ def stl_to_faces_json(stl_bytes: bytes):
             return chosen + [chosen[0]]
 
         # 7) Shift to (0,0) (native), then scale to inches
-        xs = [p[0] for loop in loops_native for p in loop]
-        ys = [p[1] for loop in loops_native for p in loop]
+        xs = [p[0] for loop in loops_native_all for p in loop]
+        ys = [p[1] for loop in loops_native_all for p in loop]
         min_x, min_y = min(xs), min(ys)
 
         loops_in = []
-        for loop in loops_native:
+        for loop in loops_native_all:
             pts_in = [((p[0] - min_x) * scale, (p[1] - min_y) * scale) for p in loop]
             loops_in.append(pts_in)
 
         # 8) Canonicalize + de-dup loops (stable across reverse / start-index)
-        # Signature is the canonical vertex sequence, rounded.
         dedup = {}
         for pts_in in loops_in:
             can = canonicalize_loop(pts_in)
@@ -743,7 +798,6 @@ def stl_to_faces_json(stl_bytes: bytes):
 
             sig = tuple((round(x, 6), round(y, 6)) for (x, y) in can)
             if sig in dedup:
-                # Keep the higher-area one (should be identical; this is defensive)
                 if poly_area_xy(can) > poly_area_xy(dedup[sig]):
                     dedup[sig] = can
             else:
