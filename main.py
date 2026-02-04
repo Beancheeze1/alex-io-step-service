@@ -500,9 +500,12 @@ def stl_to_faces_json(stl_bytes: bytes):
     - Loop canonicalization + de-duplication (prevents stacked cavities)
     - outerLoopIndex computed AFTER filtering/deduping (prevents outer being treated as a cavity)
 
-    NEW (Path A): Region-boundary edges (per connected triangle region on top plane)
+    Region-boundary edges (per connected triangle region on top plane):
       - Fixes missing "compound" cavities whose perimeter was fragmented by global edge counts.
-      - We still emit each closed loop independently (overlay cavities are allowed in editor).
+
+    NEW (Path A): spur pruning on the region boundary graph:
+      - Removes degree-1 "hair" segments (like the top-right stub) that prevent loop closure.
+      - Does not affect closed cycles (all degree-2 nodes).
     """
     from collections import defaultdict
     import math
@@ -602,7 +605,6 @@ def stl_to_faces_json(stl_bytes: bytes):
                 (tri[1][0], tri[1][1]),
                 (tri[2][0], tri[2][1]),
             ]
-            # snap vertices themselves so connectivity is stable
             sp = [snap_xy(p[0], p[1]) for p in pts]
             tri_pts.append((sp[0], sp[1], sp[2]))
 
@@ -619,12 +621,10 @@ def stl_to_faces_json(stl_bytes: bytes):
             raise ValueError("No triangles on selected top plane")
 
         # 5) Connected components of triangles on the top plane
-        # Two triangles are adjacent if they share an edge (after snapping).
         adj_tris = [[] for _ in range(len(tri_pts))]
         for e, idxs in edge_to_tris.items():
             if len(idxs) < 2:
                 continue
-            # connect all triangles that share this edge
             for i in range(len(idxs)):
                 a = idxs[i]
                 for j in range(i + 1, len(idxs)):
@@ -652,8 +652,56 @@ def stl_to_faces_json(stl_bytes: bytes):
         if not components:
             raise ValueError("No connected triangle regions found")
 
-        # 6) For each component, compute boundary edges = edges with count==1 within THAT component
-        # Then loop-walk on those boundary edges.
+        # Spur pruning: remove degree-1 nodes iteratively, returning pruned edge list.
+        def prune_spurs(boundary_edges):
+            if not boundary_edges:
+                return []
+
+            # adjacency as sets for easy removal
+            adj = defaultdict(set)
+            for a, b in boundary_edges:
+                adj[a].add(b)
+                adj[b].add(a)
+
+            # seed leaves (degree 1). Degree 0 won't exist in edge list.
+            leaves = [v for v, nbs in adj.items() if len(nbs) == 1]
+
+            # remove leaves iteratively; this removes "hairs" without touching cycles
+            while leaves:
+                v = leaves.pop()
+                if v not in adj:
+                    continue
+                if len(adj[v]) != 1:
+                    continue
+
+                u = next(iter(adj[v]))
+                # remove edge v-u
+                adj[u].discard(v)
+                adj[v].discard(u)
+
+                # delete isolated node
+                if len(adj[v]) == 0:
+                    del adj[v]
+
+                # if u became a leaf, process it
+                if u in adj and len(adj[u]) == 1:
+                    leaves.append(u)
+                # clean up u if isolated
+                if u in adj and len(adj[u]) == 0:
+                    del adj[u]
+
+            # rebuild undirected edges list (unique)
+            out = []
+            seen_e = set()
+            for a, nbs in adj.items():
+                for b in nbs:
+                    e = (a, b) if a <= b else (b, a)
+                    if e in seen_e:
+                        continue
+                    seen_e.add(e)
+                    out.append(e)
+            return out
+
         def turn_angle(prev_pt, cur_pt, nxt_pt):
             ax = cur_pt[0] - prev_pt[0]
             ay = cur_pt[1] - prev_pt[1]
@@ -668,6 +716,8 @@ def stl_to_faces_json(stl_bytes: bytes):
 
         loops_native_all = []
 
+        # 6) For each component, compute boundary edges = edges with count==1 within THAT component
+        # Then spur-prune, then loop-walk.
         for comp in components:
             edge_count = defaultdict(int)
             for ti in comp:
@@ -678,7 +728,11 @@ def stl_to_faces_json(stl_bytes: bytes):
             if not boundary_edges:
                 continue
 
-            # adjacency of boundary edges (vertex graph)
+            # NEW: prune spur/hair segments that prevent loop closure
+            boundary_edges = prune_spurs(boundary_edges)
+            if not boundary_edges:
+                continue
+
             adj = defaultdict(list)
             for a, b in boundary_edges:
                 adj[a].append(b)
@@ -738,7 +792,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                         loops_native_all.append(loop)
 
         if not loops_native_all:
-            raise ValueError("Failed to assemble loops from region boundary edges")
+            raise ValueError("Failed to assemble loops from region boundary edges (after spur pruning)")
 
         # --- helpers for area + canonicalization + dedupe (in inches coordinates) ---
         def poly_area_xy(pts_xy):
