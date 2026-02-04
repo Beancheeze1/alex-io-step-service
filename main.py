@@ -499,7 +499,8 @@ def stl_to_faces_json(stl_bytes: bytes):
     - Angle-based loop walking
     - Loop canonicalization + de-duplication (prevents stacked cavities)
     - outerLoopIndex computed AFTER filtering/deduping (prevents outer being treated as a cavity)
-    - NEW: junction bridge-split (remove tiny throat edges at degree>=3 junctions when it increases extracted closed loops)
+    - Junction-aware bridge split (SHORT-edge only) to handle “throat” connections
+    - Geometry-signature dedupe (bbox+area+vertexCount) to prevent duplicate cavity loops
     """
     from collections import defaultdict
     import math
@@ -562,6 +563,10 @@ def stl_to_faces_json(stl_bytes: bytes):
 
         # Drop only truly tiny edges (keep small features)
         min_edge = 0.15 * tol_native
+
+        # Bridge split max edge length (native units). Conservative: 3x heal tol.
+        # This prevents cutting legitimate boundaries and creating duplicate loops.
+        BRIDGE_MAX_LEN_NATIVE = 3.0 * tol_native
 
         # 4) Count edges; boundary edges appear once (with snapping/healing)
         edge_count = defaultdict(int)
@@ -742,11 +747,10 @@ def stl_to_faces_json(stl_bytes: bytes):
 
                 return loops_out
 
-            # Dedup by canonical signature so we can compare “count” fairly
-            def canonical_sig(loop_pts):
+            def canonicalize_loop_pts(loop_pts):
                 pts = loop_pts[:-1] if (len(loop_pts) > 1 and loop_pts[0] == loop_pts[-1]) else list(loop_pts)
                 if len(pts) < 3:
-                    return None
+                    return loop_pts
 
                 def rotate_to_min(seq):
                     mi = min(range(len(seq)), key=lambda i: (seq[i][0], seq[i][1]))
@@ -758,31 +762,26 @@ def stl_to_faces_json(stl_bytes: bytes):
                 rep_fwd = tuple((round(p[0], 6), round(p[1], 6)) for p in fwd)
                 rep_rev = tuple((round(p[0], 6), round(p[1], 6)) for p in rev)
 
-                rep = rep_fwd if rep_fwd <= rep_rev else rep_rev
-                return rep
+                chosen = fwd if rep_fwd <= rep_rev else rev
+                return chosen + [chosen[0]]
 
             all_loops = []
             all_loops.extend(walk("min"))
             all_loops.extend(walk("max"))
 
+            # Light dedupe here (exact canonical vertex list) — final dedupe is geometric.
             uniq = {}
             for lp in all_loops:
-                sig = canonical_sig(lp)
-                if sig is None:
-                    continue
+                can = canonicalize_loop_pts(lp)
+                sig = tuple((round(p[0], 6), round(p[1], 6)) for p in can)
                 if sig not in uniq:
-                    # keep the loop in its current orientation, but ensure closure
-                    if lp[0] != lp[-1]:
-                        lp = lp + [lp[0]]
-                    uniq[sig] = lp
+                    uniq[sig] = can
 
             return list(uniq.values())
 
-        # NEW: bridge-split at junctions (degree>=3)
-        # Goal: remove “throat/bridge” edges that prevent the cavity boundary from forming a closed loop.
-        # Mechanism: test removing each incident edge; keep removals that increase extracted closed-loop count.
+        # NEW: bridge-split at junctions (degree>=3), SHORT-edge only.
+        # Keep removals only when they increase the number of extracted closed loops.
         def bridge_split_junctions(adj_in):
-            # Work on a mutable adjacency of sets for easy remove/restore
             g = _dd(set)
             for a0, nbs0 in adj_in.items():
                 for b0 in nbs0:
@@ -794,11 +793,12 @@ def stl_to_faces_json(stl_bytes: bytes):
                     out2[a0] = list(nbs0)
                 return out2
 
-            # Cap iterations to avoid runaway on gnarly meshes
+            def edge_len(a0, b0):
+                return math.hypot(float(b0[0]) - float(a0[0]), float(b0[1]) - float(a0[1]))
+
             max_iters = 25
             it = 0
 
-            # Baseline loop count
             base_loops = extract_loops_from_adj(to_list_adj(g))
             base_count = len(base_loops)
 
@@ -807,21 +807,23 @@ def stl_to_faces_json(stl_bytes: bytes):
                 it += 1
                 changed = False
 
-                # Snapshot nodes because we mutate g
                 nodes = list(g.keys())
                 for v in nodes:
                     if v not in g:
                         continue
                     if len(g[v]) < 3:
-                        continue  # only junctions
+                        continue
 
-                    # Try removing each incident edge (v-u)
                     nbrs = list(g[v])
                     for u in nbrs:
                         if u not in g or v not in g[u]:
                             continue
 
-                        # Remove edge
+                        # SHORT-edge gate: only consider cutting likely “throat” edges.
+                        if edge_len(v, u) > BRIDGE_MAX_LEN_NATIVE:
+                            continue
+
+                        # remove edge
                         g[v].discard(u)
                         g[u].discard(v)
                         if len(g[v]) == 0:
@@ -833,12 +835,11 @@ def stl_to_faces_json(stl_bytes: bytes):
                         test_count = len(test_loops)
 
                         if test_count > base_count:
-                            # Keep removal (bridge edge)
                             base_count = test_count
                             changed = True
-                            # continue scanning; do NOT restore
+                            # keep removal
                         else:
-                            # Restore edge
+                            # restore
                             if v not in g:
                                 g[v] = set()
                             if u not in g:
@@ -854,9 +855,8 @@ def stl_to_faces_json(stl_bytes: bytes):
         if not loops_native:
             raise ValueError("Failed to assemble loops from boundary edges")
 
-        # --- helpers for area + canonicalization + dedupe (in inches coordinates) ---
+        # --- helpers for area + canonicalization + geometric dedupe (in inches coordinates) ---
         def poly_area_xy(pts_xy):
-            # pts_xy is list of (x,y) with closure optional
             if len(pts_xy) < 3:
                 return 0.0
             pts = pts_xy
@@ -868,16 +868,8 @@ def stl_to_faces_json(stl_bytes: bytes):
             return abs(a2) * 0.5
 
         def canonicalize_loop(pts_xy):
-            """
-            Normalize loop representation so the same loop dedupes across:
-              - different start index
-              - reversed direction
-            Returns CLOSED list (last == first).
-            """
             if len(pts_xy) < 4:
                 return pts_xy
-
-            # remove trailing closure for canonical work
             pts = pts_xy[:-1] if pts_xy[0] == pts_xy[-1] else list(pts_xy)
             if len(pts) < 3:
                 return pts_xy
@@ -905,18 +897,30 @@ def stl_to_faces_json(stl_bytes: bytes):
             pts_in = [((p[0] - min_x) * scale, (p[1] - min_y) * scale) for p in loop]
             loops_in.append(pts_in)
 
-        # 8) Canonicalize + de-dup loops (stable across reverse / start-index)
-        # Signature is the canonical vertex sequence, rounded.
+        # 8) Canonicalize + GEOMETRIC de-dup loops (bbox + area + vertexCount)
         dedup = {}
         for pts_in in loops_in:
             can = canonicalize_loop(pts_in)
             if len(can) < 4 or can[0] != can[-1]:
                 continue
 
-            sig = tuple((round(x, 6), round(y, 6)) for (x, y) in can)
+            xs2 = [p[0] for p in can]
+            ys2 = [p[1] for p in can]
+            bbox = (min(xs2), min(ys2), max(xs2), max(ys2))
+            area = poly_area_xy(can)
+
+            # geometry signature (rounded)
+            sig = (
+                round(bbox[0], 5),
+                round(bbox[1], 5),
+                round(bbox[2], 5),
+                round(bbox[3], 5),
+                round(area, 6),
+                len(can),
+            )
+
             if sig in dedup:
-                # Keep the higher-area one (should be identical; this is defensive)
-                if poly_area_xy(can) > poly_area_xy(dedup[sig]):
+                if area > poly_area_xy(dedup[sig]):
                     dedup[sig] = can
             else:
                 dedup[sig] = can
