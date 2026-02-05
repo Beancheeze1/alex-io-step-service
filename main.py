@@ -294,7 +294,7 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
             W_mm,
             T_mm,
             z_bottom,
-            cropped=c            ropped_layer,
+            cropped=cropped_layer,
             chamfer_mm=chamfer_mm,
             rounded=rounded_layer,
             radius_mm=radius_mm,
