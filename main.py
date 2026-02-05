@@ -55,20 +55,12 @@ from stl import mesh as stlmesh
 
 INCH_TO_MM = 25.4
 
-# Legacy behavior: never cut full thickness (blind pockets)
 DEPTH_CLAMP_RATIO = 0.95
-
-# Through-cut epsilon: ensures the cut cleanly exits the bottom face
 THROUGH_CUT_EPS_MM = 0.25
-
-# Small epsilon to avoid fillet edge-case when radius ~= half the side
 FILLET_EPS_MM = 1e-3
-
-# Default outer round radius (inches) when roundCorners is true but radius omitted/invalid
 DEFAULT_OUTER_ROUND_IN = 0.25
 
 # STL corner heal tolerance (inches). Used only in stl_to_faces_json().
-# Dialed back from 1/32" to 1/64" to avoid merging/suppressing small cavities.
 STL_HEAL_TOL_IN = 0.015625  # 1/64"
 
 
@@ -79,10 +71,9 @@ class Cavity(BaseModel):
     x: float = Field(..., ge=0.0, le=1.0)
     y: float = Field(..., ge=0.0, le=1.0)
 
-    shape: Optional[str] = None           # "rect" | "circle" | "roundedRect" (optional)
-    diameterIn: Optional[float] = None    # for circle cavities
+    shape: Optional[str] = None
+    diameterIn: Optional[float] = None
 
-    # NEW (Path A): optional rounded-rect radius (inches)
     cornerRadiusIn: Optional[float] = None
     corner_radius_in: Optional[float] = None
 
@@ -98,11 +89,9 @@ class FoamLayer(BaseModel):
     label: Optional[str] = None
     cavities: Optional[List[Cavity]] = None
 
-    # Per-layer cropped corner override (optional)
     cropCorners: Optional[bool] = None
     crop_corners: Optional[bool] = None
 
-    # NEW: per-layer rounded outer corners (optional)
     roundCorners: Optional[bool] = None
     round_corners: Optional[bool] = None
     roundRadiusIn: Optional[float] = None
@@ -120,16 +109,13 @@ class Block(BaseModel):
     widthIn: float
     thicknessIn: float
 
-    # Global crop-corners intent
     croppedCorners: Optional[bool] = None
     cropped_corners: Optional[bool] = None
 
-    # Keep chamfer size support (inches)
     chamferIn: Optional[float] = None
     chamfer_in: Optional[float] = None
 
-    # Accept "cornerStyle" to match SVG/DXF export wiring
-    cornerStyle: Optional[str] = None        # "square" | "chamfer"
+    cornerStyle: Optional[str] = None
     corner_style: Optional[str] = None
 
     @validator("lengthIn", "widthIn", "thicknessIn")
@@ -189,17 +175,11 @@ def _resolve_corner_style(block: Block) -> str:
 def _resolve_cropped_global(block: Block) -> bool:
     if _truthy_bool(block.croppedCorners) or _truthy_bool(block.cropped_corners):
         return True
-
     corner_style = _resolve_corner_style(block)
     return corner_style == "chamfer"
 
 
 def _resolve_cropped_for_layer(layer: FoamLayer, cropped_global: bool) -> bool:
-    """
-    Per-layer override:
-      - If layer explicitly sets cropCorners true/false, honor it
-      - If omitted (None), fall back to global intent
-    """
     if layer.cropCorners is True or layer.crop_corners is True:
         return True
     if layer.cropCorners is False or layer.crop_corners is False:
@@ -231,17 +211,6 @@ def build_layer_block(
     rounded: bool,
     radius_mm: float,
 ):
-    """
-    Build one layer block.
-
-    Coordinates are CAD bottom-left origin.
-    Base block is always from (0,0, z) to (L, W, z+T).
-
-    Precedence:
-      - If rounded: fillet vertical edges (SAFE fallback if fillet fails)
-      - Else if cropped: chamfer two corners (UL and LR) using polygon profile
-      - Else: square box
-    """
     def _square():
         return (
             cq.Workplane("XY")
@@ -253,10 +222,7 @@ def build_layer_block(
         r = float(radius_mm) if radius_mm else 0.0
         if r > 0:
             max_r = (min(L_mm, W_mm) / 2.0) - FILLET_EPS_MM
-            if max_r > 0:
-                r = max(0.0, min(r, max_r))
-            else:
-                r = 0.0
+            r = max(0.0, min(r, max_r)) if max_r > 0 else 0.0
 
         if r > 0:
             try:
@@ -293,14 +259,13 @@ def build_layer_block(
         (0.0, W_mm - c),
     ]
 
-    solid = (
+    return (
         cq.Workplane("XY")
         .polyline(pts)
         .close()
         .extrude(T_mm)
         .translate((0, 0, z))
     )
-    return solid
 
 
 def build_cad_from_layout(layout: Layout) -> cq.Workplane:
@@ -308,7 +273,6 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
     W_mm = layout.block.widthIn * INCH_TO_MM
 
     cropped_global = _resolve_cropped_global(layout.block)
-
     chamfer_in = _resolve_chamfer_in(layout.block)
     chamfer_mm = chamfer_in * INCH_TO_MM
 
@@ -321,7 +285,6 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
             continue
 
         cropped_layer = _resolve_cropped_for_layer(layer, cropped_global)
-
         rounded_layer = _resolve_round_for_layer(layer)
         radius_in = _resolve_round_radius_in(layer)
         radius_mm = float(radius_in) * INCH_TO_MM if radius_in else 0.0
@@ -331,7 +294,7 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
             W_mm,
             T_mm,
             z_bottom,
-            cropped=cropped_layer,
+            cropped=c            ropped_layer,
             chamfer_mm=chamfer_mm,
             rounded=rounded_layer,
             radius_mm=radius_mm,
@@ -345,10 +308,8 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
                 d_mm = float(c.depthIn) * INCH_TO_MM
             except Exception:
                 return 0.0
-
             if d_mm >= T_mm:
                 return T_mm + THROUGH_CUT_EPS_MM
-
             return min(d_mm, T_mm * DEPTH_CLAMP_RATIO)
 
         cavities.sort(key=_eff_depth_mm)
@@ -359,13 +320,8 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
             except Exception:
                 continue
 
-            if req_mm >= T_mm:
-                cav_D = T_mm + THROUGH_CUT_EPS_MM
-            else:
-                cav_D = min(req_mm, T_mm * DEPTH_CLAMP_RATIO)
-
+            cav_D = (T_mm + THROUGH_CUT_EPS_MM) if req_mm >= T_mm else min(req_mm, T_mm * DEPTH_CLAMP_RATIO)
             shape = (cav.shape or "rect").strip().lower()
-
             corner_r_in = _safe_pos(cav.cornerRadiusIn) or _safe_pos(cav.corner_radius_in) or None
 
             z_top = z_bottom + T_mm
@@ -393,11 +349,9 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
                         .circle(r_mm)
                         .extrude(cav_D)
                     )
-
                 else:
                     cav_L = float(cav.lengthIn) * INCH_TO_MM
                     cav_W = float(cav.widthIn) * INCH_TO_MM
-
                     if cav_L >= L_mm or cav_W >= W_mm:
                         continue
 
@@ -411,10 +365,7 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
                     if corner_r_in is not None and corner_r_in > 0:
                         r_mm = float(corner_r_in) * INCH_TO_MM
                         max_r = (min(cav_L, cav_W) / 2.0) - FILLET_EPS_MM
-                        if max_r <= 0:
-                            r_mm = 0.0
-                        else:
-                            r_mm = max(0.0, min(r_mm, max_r))
+                        r_mm = max(0.0, min(r_mm, max_r)) if max_r > 0 else 0.0
 
                     if shape in ("roundedrect", "rounded_rect", "rounded-rect") or r_mm > 0:
                         cx = x_left + (cav_L / 2.0)
@@ -427,7 +378,6 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
                             .rect(cav_L, cav_W)
                             .extrude(cav_D)
                         )
-
                         if r_mm > 0:
                             cavity = cavity.edges("|Z").fillet(r_mm)
                     else:
@@ -463,44 +413,14 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
     return solid
 
 
-def _convex_hull_2d(points):
-    """
-    Monotonic chain convex hull.
-    points: list of (x,y)
-    returns hull list in CCW order without repeating first point
-    """
-    pts = sorted(set(points))
-    if len(pts) <= 1:
-        return pts
-
-    def cross(o, a, b):
-        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-
-    lower = []
-    for p in pts:
-        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
-            lower.pop()
-        lower.append(p)
-
-    upper = []
-    for p in reversed(pts):
-        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
-            upper.pop()
-        upper.append(p)
-
-    return lower[:-1] + upper[:-1]
-
-
 def stl_to_faces_json(stl_bytes: bytes):
     """
     STL → faces_json extraction (top-face boundary edges) with:
     - Corner healing via vertex snapping (tolerance grid)
     - Reduced tolerance (1/64") to avoid collapsing small cavities
     - Angle-based loop walking
-    - Loop canonicalization + de-duplication (prevents stacked cavities)
-    - outerLoopIndex computed AFTER filtering/deduping (prevents outer being treated as a cavity)
     - Junction-aware bridge split (SHORT-edge only) to handle “throat” connections
-    - Geometry-signature dedupe (bbox+area+vertexCount) to prevent duplicate cavity loops
+    - NEW: snap+simplify+canonical signature dedupe (fixes same-loop traced with different point counts/pathing)
     """
     from collections import defaultdict
     import math
@@ -511,9 +431,8 @@ def stl_to_faces_json(stl_bytes: bytes):
 
     try:
         m = stlmesh.Mesh.from_file(stl_path)
-        tris = m.vectors  # (n, 3, 3) numpy floats
+        tris = m.vectors
 
-        # 1) Upward-facing triangles (top-ish)
         top_tris = []
         for tri in tris:
             v1, v2, v3 = tri
@@ -526,13 +445,11 @@ def stl_to_faces_json(stl_bytes: bytes):
         if not top_tris:
             raise ValueError("No upward-facing triangles found")
 
-        # 2) Group by Z plane (coplanar-ish)
         planes = defaultdict(list)
         for tri in top_tris:
             z = float((tri[0][2] + tri[1][2] + tri[2][2]) / 3.0)
             planes[round(z, 4)].append(tri)
 
-        # 3) Choose largest plane by projected XY area
         def tri_area(t):
             a, b, c = t
             ax, ay = float(a[0]), float(a[1])
@@ -542,7 +459,6 @@ def stl_to_faces_json(stl_bytes: bytes):
 
         plane_tris = max(planes.values(), key=lambda lst: sum(tri_area(t) for t in lst))
 
-        # --- Determine native span (for mm/in heuristic + heal tolerance in native units) ---
         raw_xs = []
         raw_ys = []
         for tri in plane_tris:
@@ -556,19 +472,13 @@ def stl_to_faces_json(stl_bytes: bytes):
         assume_mm = float(raw_span) > 120.0
         scale = (1.0 / INCH_TO_MM) if assume_mm else 1.0
 
-        # Heal tolerance expressed in STL native units
         tol_native = float(STL_HEAL_TOL_IN) * (INCH_TO_MM if assume_mm else 1.0)
         if not (tol_native > 0.0):
             tol_native = 1e-6
 
-        # Drop only truly tiny edges (keep small features)
         min_edge = 0.15 * tol_native
-
-        # Bridge split max edge length (native units). Conservative: 3x heal tol.
-        # This prevents cutting legitimate boundaries and creating duplicate loops.
         BRIDGE_MAX_LEN_NATIVE = 3.0 * tol_native
 
-        # 4) Count edges; boundary edges appear once (with snapping/healing)
         edge_count = defaultdict(int)
         canon = {}
 
@@ -586,10 +496,8 @@ def stl_to_faces_json(stl_bytes: bytes):
         def edge_key(a, b):
             ax, ay = snap_xy(a[0], a[1])
             bx, by = snap_xy(b[0], b[1])
-
             if math.hypot(bx - ax, by - ay) < min_edge:
                 return None
-
             p1 = (float(ax), float(ay))
             p2 = (float(bx), float(by))
             return tuple(sorted((p1, p2)))
@@ -610,7 +518,6 @@ def stl_to_faces_json(stl_bytes: bytes):
         if not boundary_edges:
             raise ValueError("No boundary edges found on selected top plane")
 
-        # 5) Build adjacency
         from collections import defaultdict as _dd
 
         adj = _dd(list)
@@ -618,27 +525,23 @@ def stl_to_faces_json(stl_bytes: bytes):
             adj[a].append(b)
             adj[b].append(a)
 
-        # 5.5) Spur pruning (degree-1 hair removal) to avoid open “tails” breaking cycles
-        def prune_spurs(boundary_edges_in):
-            if not boundary_edges_in:
+        def prune_spurs(edges_in):
+            if not edges_in:
                 return []
-
             g = _dd(set)
-            for a2, b2 in boundary_edges_in:
+            for a2, b2 in edges_in:
                 g[a2].add(b2)
                 g[b2].add(a2)
 
             leaves = [v for v, nbs in g.items() if len(nbs) == 1]
             while leaves:
                 v = leaves.pop()
-                if v not in g:
-                    continue
-                if len(g[v]) != 1:
+                if v not in g or len(g[v]) != 1:
                     continue
                 u = next(iter(g[v]))
                 g[u].discard(v)
                 g[v].discard(u)
-                if len(g[v]) == 0 and v in g:
+                if v in g and len(g[v]) == 0:
                     del g[v]
                 if u in g and len(g[u]) == 1:
                     leaves.append(u)
@@ -646,13 +549,13 @@ def stl_to_faces_json(stl_bytes: bytes):
                     del g[u]
 
             out = []
-            seen_e = set()
+            seen = set()
             for a2, nbs in g.items():
                 for b2 in nbs:
                     e = (a2, b2) if a2 <= b2 else (b2, a2)
-                    if e in seen_e:
+                    if e in seen:
                         continue
-                    seen_e.add(e)
+                    seen.add(e)
                     out.append(e)
             return out
 
@@ -663,7 +566,6 @@ def stl_to_faces_json(stl_bytes: bytes):
                 adj[a].append(b)
                 adj[b].append(a)
 
-        # 6) Angle-based loop walking
         def turn_angle(prev_pt, cur_pt, nxt_pt):
             ax = cur_pt[0] - prev_pt[0]
             ay = cur_pt[1] - prev_pt[1]
@@ -677,16 +579,11 @@ def stl_to_faces_json(stl_bytes: bytes):
             return ang
 
         def extract_loops_from_adj(adj_in):
-            """
-            Extract CLOSED loops from the boundary graph by walking directed edges,
-            using BOTH turn preferences (min-angle and max-angle).
-            Returns list of loops (each is list of points, CLOSED with last == first).
-            """
             def walk(prefer: str):
                 used_dir = set()
                 loops_out = []
-                boundary_edge_count = sum(len(v) for v in adj_in.values()) // 2
-                max_steps = max(1000, boundary_edge_count * 2)
+                edge_ct = sum(len(v) for v in adj_in.values()) // 2
+                max_steps = max(1000, edge_ct * 2)
 
                 def dir_id(p, q):
                     return (p, q)
@@ -701,8 +598,8 @@ def stl_to_faces_json(stl_bytes: bytes):
 
                         prev = start
                         cur = nxt
-
                         steps = 0
+
                         while steps < max_steps:
                             steps += 1
                             nbrs = adj_in[cur]
@@ -737,8 +634,8 @@ def stl_to_faces_json(stl_bytes: bytes):
 
                             used_dir.add(dir_id(cur, best))
                             loop.append(best)
-
                             prev, cur = cur, best
+
                             if cur == start:
                                 break
 
@@ -758,10 +655,8 @@ def stl_to_faces_json(stl_bytes: bytes):
 
                 fwd = rotate_to_min(pts)
                 rev = rotate_to_min(list(reversed(pts)))
-
                 rep_fwd = tuple((round(p[0], 6), round(p[1], 6)) for p in fwd)
                 rep_rev = tuple((round(p[0], 6), round(p[1], 6)) for p in rev)
-
                 chosen = fwd if rep_fwd <= rep_rev else rev
                 return chosen + [chosen[0]]
 
@@ -769,7 +664,6 @@ def stl_to_faces_json(stl_bytes: bytes):
             all_loops.extend(walk("min"))
             all_loops.extend(walk("max"))
 
-            # Light dedupe here (exact canonical vertex list) — final dedupe is geometric.
             uniq = {}
             for lp in all_loops:
                 can = canonicalize_loop_pts(lp)
@@ -779,8 +673,6 @@ def stl_to_faces_json(stl_bytes: bytes):
 
             return list(uniq.values())
 
-        # NEW: bridge-split at junctions (degree>=3), SHORT-edge only.
-        # Keep removals only when they increase the number of extracted closed loops.
         def bridge_split_junctions(adj_in):
             g = _dd(set)
             for a0, nbs0 in adj_in.items():
@@ -796,50 +688,37 @@ def stl_to_faces_json(stl_bytes: bytes):
             def edge_len(a0, b0):
                 return math.hypot(float(b0[0]) - float(a0[0]), float(b0[1]) - float(a0[1]))
 
-            max_iters = 25
-            it = 0
-
             base_loops = extract_loops_from_adj(to_list_adj(g))
             base_count = len(base_loops)
 
+            max_iters = 25
+            it = 0
             changed = True
+
             while changed and it < max_iters:
                 it += 1
                 changed = False
-
-                nodes = list(g.keys())
-                for v in nodes:
-                    if v not in g:
+                for v in list(g.keys()):
+                    if v not in g or len(g[v]) < 3:
                         continue
-                    if len(g[v]) < 3:
-                        continue
-
-                    nbrs = list(g[v])
-                    for u in nbrs:
+                    for u in list(g[v]):
                         if u not in g or v not in g[u]:
                             continue
-
-                        # SHORT-edge gate: only consider cutting likely “throat” edges.
                         if edge_len(v, u) > BRIDGE_MAX_LEN_NATIVE:
                             continue
 
-                        # remove edge
                         g[v].discard(u)
                         g[u].discard(v)
-                        if len(g[v]) == 0:
+                        if v in g and len(g[v]) == 0:
                             del g[v]
                         if u in g and len(g[u]) == 0:
                             del g[u]
 
                         test_loops = extract_loops_from_adj(to_list_adj(g))
-                        test_count = len(test_loops)
-
-                        if test_count > base_count:
-                            base_count = test_count
+                        if len(test_loops) > base_count:
+                            base_count = len(test_loops)
                             changed = True
-                            # keep removal
                         else:
-                            # restore
                             if v not in g:
                                 g[v] = set()
                             if u not in g:
@@ -850,12 +729,10 @@ def stl_to_faces_json(stl_bytes: bytes):
             return to_list_adj(g)
 
         adj = bridge_split_junctions(adj)
-
         loops_native = extract_loops_from_adj(adj)
         if not loops_native:
             raise ValueError("Failed to assemble loops from boundary edges")
 
-        # --- helpers for area + canonicalization + geometric dedupe (in inches coordinates) ---
         def poly_area_xy(pts_xy):
             if len(pts_xy) < 3:
                 return 0.0
@@ -867,12 +744,95 @@ def stl_to_faces_json(stl_bytes: bytes):
                 a2 += pts[i][0] * pts[i + 1][1] - pts[i + 1][0] * pts[i][1]
             return abs(a2) * 0.5
 
-        def canonicalize_loop(pts_xy):
-            if len(pts_xy) < 4:
-                return pts_xy
-            pts = pts_xy[:-1] if pts_xy[0] == pts_xy[-1] else list(pts_xy)
+        # Shift to (0,0) (native), then scale to inches
+        xs = [p[0] for loop in loops_native for p in loop]
+        ys = [p[1] for loop in loops_native for p in loop]
+        min_x, min_y = min(xs), min(ys)
+
+        loops_in = []
+        for loop in loops_native:
+            pts_in = [((p[0] - min_x) * scale, (p[1] - min_y) * scale) for p in loop]
+            loops_in.append(pts_in)
+
+        # ---------------------------------------------------------------------
+        # 8) Snap + simplify + canonical signature de-dup
+        # ---------------------------------------------------------------------
+        snap_in = max(STL_HEAL_TOL_IN * 0.25, 1e-6)  # inches
+        col_eps = snap_in * snap_in  # cross-product threshold scale
+
+        def _snap_pt(p):
+            return (
+                round(float(p[0]) / snap_in) * snap_in,
+                round(float(p[1]) / snap_in) * snap_in,
+            )
+
+        def _simplify_closed(loop_pts):
+            # expects closed or open; returns CLOSED list
+            if not loop_pts or len(loop_pts) < 4:
+                return loop_pts
+
+            pts = loop_pts[:-1] if loop_pts[0] == loop_pts[-1] else list(loop_pts)
+
+            # snap
+            pts = [_snap_pt(p) for p in pts]
+
+            # drop consecutive duplicates
+            ded = []
+            for p in pts:
+                if not ded or p != ded[-1]:
+                    ded.append(p)
+            pts = ded
+
+            # ensure minimum
             if len(pts) < 3:
-                return pts_xy
+                return loop_pts
+
+            # remove near-collinear middle points
+            changed = True
+            guard = 0
+            while changed and guard < 10:
+                guard += 1
+                changed = False
+                if len(pts) <= 3:
+                    break
+
+                out = []
+                n = len(pts)
+                for i in range(n):
+                    a = pts[(i - 1) % n]
+                    b = pts[i]
+                    c = pts[(i + 1) % n]
+
+                    abx = b[0] - a[0]
+                    aby = b[1] - a[1]
+                    bcx = c[0] - b[0]
+                    bcy = c[1] - b[1]
+
+                    # cross product magnitude squared proxy
+                    cross = abx * bcy - aby * bcx
+                    if abs(cross) <= col_eps:
+                        # drop b if it’s basically on the same line
+                        changed = True
+                        continue
+                    out.append(b)
+
+                if len(out) >= 3:
+                    pts = out
+                else:
+                    break
+
+            # re-close
+            pts = pts + [pts[0]]
+            return pts
+
+        def _canonicalize(loop_pts):
+            # loop_pts must be CLOSED
+            if len(loop_pts) < 4 or loop_pts[0] != loop_pts[-1]:
+                return loop_pts
+
+            pts = loop_pts[:-1]
+            if len(pts) < 3:
+                return loop_pts
 
             def rotate_to_min(seq):
                 mi = min(range(len(seq)), key=lambda i: (seq[i][0], seq[i][1]))
@@ -887,59 +847,30 @@ def stl_to_faces_json(stl_bytes: bytes):
             chosen = fwd if rep_fwd <= rep_rev else rev
             return chosen + [chosen[0]]
 
-        # 7) Shift to (0,0) (native), then scale to inches
-        xs = [p[0] for loop in loops_native for p in loop]
-        ys = [p[1] for loop in loops_native for p in loop]
-        min_x, min_y = min(xs), min(ys)
-
-        loops_in = []
-        for loop in loops_native:
-            pts_in = [((p[0] - min_x) * scale, (p[1] - min_y) * scale) for p in loop]
-            loops_in.append(pts_in)
-
-        # 8) Canonicalize + GEOMETRIC de-dup loops (bbox + area + vertexCount)
         dedup = {}
-        for pts_in in loops_in:
-            can = canonicalize_loop(pts_in)
+        for lp in loops_in:
+            simp = _simplify_closed(lp)
+            can = _canonicalize(simp)
             if len(can) < 4 or can[0] != can[-1]:
                 continue
-
-            xs2 = [p[0] for p in can]
-            ys2 = [p[1] for p in can]
-            bbox = (min(xs2), min(ys2), max(xs2), max(ys2))
-            area = poly_area_xy(can)
-
-            # geometry signature (rounded)
-            sig = (
-                round(bbox[0], 5),
-                round(bbox[1], 5),
-                round(bbox[2], 5),
-                round(bbox[3], 5),
-                round(area, 6),
-                len(can),
-            )
-
-            if sig in dedup:
-                if area > poly_area_xy(dedup[sig]):
-                    dedup[sig] = can
-            else:
+            sig = tuple((round(p[0], 6), round(p[1], 6)) for p in can)
+            if sig not in dedup:
                 dedup[sig] = can
 
         loops_can = list(dedup.values())
         if not loops_can:
-            raise ValueError("No valid loops after dedupe")
+            raise ValueError("No valid loops after simplify/dedupe")
 
-        # 9) Drop microscopic loops (noise) — conservative (avoid losing cavities)
+        # Drop microscopic loops (noise) — conservative
         min_area_in2 = (STL_HEAL_TOL_IN * STL_HEAL_TOL_IN) * 0.10
         filtered = [l for l in loops_can if poly_area_xy(l) >= min_area_in2]
         if not filtered:
             filtered = loops_can
 
-        # 10) Choose outer as largest area AFTER dedupe/filtering
+        # Choose outer as largest area AFTER dedupe/filtering
         areas = [poly_area_xy(l) for l in filtered]
         outer_idx = int(max(range(len(filtered)), key=lambda i: areas[i]))
 
-        # 11) Emit faces_json with plain Python floats
         out_loops = []
         for idx, loop in enumerate(filtered):
             pts = [{"x": float(p[0]), "y": float(p[1])} for p in loop]
@@ -994,10 +925,7 @@ async def step_from_layout(payload: StepRequest):
         step_text = export_step_text(solid)
     except Exception as exc:
         print("[STEP-SVC] Geometry error:", repr(exc))
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to build STEP geometry: {exc}",
-        )
+        raise HTTPException(status_code=400, detail=f"Failed to build STEP geometry: {exc}")
 
     if not step_text.strip():
         raise HTTPException(500, "STEP export produced empty text")
