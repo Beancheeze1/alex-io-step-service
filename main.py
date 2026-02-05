@@ -831,12 +831,6 @@ def stl_to_faces_json(stl_bytes: bytes):
         loops_native = extract_loops_from_adj(adj)
         if not loops_native:
             raise ValueError("Failed to assemble loops from boundary edges")
-        
-        # DIAGNOSTIC: Log loop count and basic stats
-        print(f"[STL-FACES] Detected {len(loops_native)} loops after bridge splitting")
-        for idx, loop in enumerate(loops_native):
-            area = poly_area_xy(loop)
-            print(f"  Loop {idx}: {len(loop)} points, area={area:.6f} native units")
 
         def poly_area_xy(pts_xy):
             if len(pts_xy) < 3:
@@ -848,6 +842,12 @@ def stl_to_faces_json(stl_bytes: bytes):
             for i in range(len(pts) - 1):
                 a2 += pts[i][0] * pts[i + 1][1] - pts[i + 1][0] * pts[i][1]
             return abs(a2) * 0.5
+        
+        # DIAGNOSTIC: Log loop count and basic stats
+        print(f"[STL-FACES] Detected {len(loops_native)} loops after bridge splitting")
+        for idx, loop in enumerate(loops_native):
+            area = poly_area_xy(loop)
+            print(f"  Loop {idx}: {len(loop)} points, area={area:.6f} native units")
 
         # Shift to (0,0) (native), then scale to inches
         xs = [p[0] for loop in loops_native for p in loop]
