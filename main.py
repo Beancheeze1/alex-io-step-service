@@ -518,6 +518,11 @@ def stl_to_faces_json(stl_bytes: bytes):
             raise ValueError("No boundary edges found on selected top plane")
 
         from collections import defaultdict as _dd
+                def to_list_adj(g_in):
+            out2 = _dd(list)
+            for a0, nbs0 in g_in.items():
+                out2[a0] = list(nbs0)
+            return out2
 
         adj = _dd(list)
         for a, b in boundary_edges:
