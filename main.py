@@ -558,9 +558,9 @@ def stl_to_faces_json(stl_bytes: bytes):
                     continue
                 u = next(iter(g[v]))
 
-                # ONLY prune if the dangling edge is VERY short (micro spur only).
-                # Increased threshold slightly to preserve more real boundaries
-                if _elen(v, u) > BRIDGE_MAX_LEN_NATIVE * 0.5:  # Changed from > BRIDGE_MAX_LEN_NATIVE
+                # ONLY prune if the dangling edge is EXTREMELY short (tiny micro spur only).
+                # Very conservative to preserve real cavity boundaries
+                if _elen(v, u) > BRIDGE_MAX_LEN_NATIVE * 0.25:  # Even more conservative
                     continue
 
                 g[u].discard(v)
@@ -731,6 +731,7 @@ def stl_to_faces_json(stl_bytes: bytes):
         # Junction-aware micro-bridge split:
         # Keep removals only if they increase UNIQUE loop count (tolerant signature).
         # This targets the missing top-left cavity (spur/junction) without duplicating others.
+        # ENHANCED: Now also considers removing edges at T-junctions even if they're longer
         # ---------------------------------------------------------------------
         def bridge_split_junctions(adj_in):
             g = _dd(set)
@@ -759,7 +760,7 @@ def stl_to_faces_json(stl_bytes: bytes):
             base_adj = to_list_adj(g)
             base_u = unique_loop_count(base_adj)
 
-            max_iters = 100  # Increased from 40 to be more thorough
+            max_iters = 150  # Increased even more for thorough search
             it = 0
             changed = True
 
@@ -767,18 +768,23 @@ def stl_to_faces_json(stl_bytes: bytes):
                 it += 1
                 changed = False
 
-                # Evaluate all candidate short edges at junctions; pick the best improvement first.
+                # Evaluate all candidate edges at junctions; pick the best improvement first.
                 best_improve = 0
                 best_remove = None
 
                 for v in list(g.keys()):
-                    if v not in g or len(g[v]) < 2:  # Changed from < 3 to catch more junctions
+                    if v not in g or len(g[v]) < 2:
                         continue
 
                     for u in list(g[v]):
                         if u not in g or v not in g[u]:
                             continue
-                        if edge_len(v, u) > BRIDGE_MAX_LEN_NATIVE:
+                        
+                        # Allow longer edges if at least one endpoint is a junction (3+ edges)
+                        is_junction = len(g[v]) >= 3 or len(g[u]) >= 3
+                        max_len = BRIDGE_MAX_LEN_NATIVE * 2.0 if is_junction else BRIDGE_MAX_LEN_NATIVE
+                        
+                        if edge_len(v, u) > max_len:
                             continue
 
                         # try remove
@@ -825,6 +831,12 @@ def stl_to_faces_json(stl_bytes: bytes):
         loops_native = extract_loops_from_adj(adj)
         if not loops_native:
             raise ValueError("Failed to assemble loops from boundary edges")
+        
+        # DIAGNOSTIC: Log loop count and basic stats
+        print(f"[STL-FACES] Detected {len(loops_native)} loops after bridge splitting")
+        for idx, loop in enumerate(loops_native):
+            area = poly_area_xy(loop)
+            print(f"  Loop {idx}: {len(loop)} points, area={area:.6f} native units")
 
         def poly_area_xy(pts_xy):
             if len(pts_xy) < 3:
