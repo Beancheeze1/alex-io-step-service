@@ -43,6 +43,10 @@
 # NEW (Path A) - THROUGH CUT:
 # - If a cavity depth is >= layer thickness, cut through the full layer.
 # - Implemented by setting cut depth to T_mm + small epsilon (ensures exit).
+#
+# SHAPE PRESERVATION FIX:
+# - Updated collinearity detection to use perpendicular distance instead of cross-product
+# - This preserves sharp corners in rectangular cavities while still removing noise
 
 from typing import List, Optional
 import os
@@ -419,15 +423,18 @@ def stl_to_faces_json(stl_bytes: bytes):
     - Corner healing via vertex snapping (tolerance grid)
     - Reduced tolerance (1/64") to avoid collapsing small cavities
     - Angle-based loop walking
-    - Junction-aware bridge split (SHORT-edge only) to handle “throat” connections
-    - snap+simplify+canonical signature dedupe
+    - Junction-aware bridge split (SHORT-edge only) to handle "throat" connections
+    - NEW: snap+simplify+canonical signature dedupe (fixes same-loop traced with different point counts/pathing)
 
-    FIX (this edit):
-    - Final geometry-cluster dedupe (bbox + centroid + area tolerant) to eliminate
-      multiple traces of the same cavity (bottom-left duplicates).
+    FIXES (this chat):
+    - Blocking A: tolerant, vertex-count-independent dedupe to stop duplicate stacked cavities.
+    - Blocking B: junction micro-bridge split scored by UNIQUE loop count (tolerant signature),
+      plus conservative spur pruning (only short spurs) to preserve true cavity boundaries.
+    - SHAPE PRESERVATION: Use perpendicular distance for collinearity instead of cross-product to preserve sharp corners
     """
     from collections import defaultdict
     import math
+    from collections import deque
 
     with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as tmp:
         stl_path = tmp.name
@@ -529,6 +536,10 @@ def stl_to_faces_json(stl_bytes: bytes):
             adj[a].append(b)
             adj[b].append(a)
 
+        # ---------------------------------------------------------------------
+        # Conservative spur pruning: only remove SHORT dangling spurs.
+        # This preserves real cavity edges while still removing "wild" corner spurs.
+        # ---------------------------------------------------------------------
         def prune_spurs(edges_in):
             if not edges_in:
                 return []
@@ -547,6 +558,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                     continue
                 u = next(iter(g[v]))
 
+                # ONLY prune if the dangling edge is short (spur / micro-bridge).
                 if _elen(v, u) > BRIDGE_MAX_LEN_NATIVE:
                     continue
 
@@ -588,6 +600,35 @@ def stl_to_faces_json(stl_bytes: bytes):
             if ang < 0:
                 ang += 2.0 * math.pi
             return ang
+
+        # ---------------------------------------------------------------------
+        # Tolerant loop signature (vertex-count independent) for UNIQUE counting
+        # and final dedupe. This is the core fix for duplicate stacked cavities.
+        # ---------------------------------------------------------------------
+        def tolerant_loop_sig(loop_pts, q=STL_HEAL_TOL_IN * 0.5):
+            # loop_pts may be closed or open; operate on unique vertices only
+            pts = loop_pts[:-1] if (len(loop_pts) > 1 and loop_pts[0] == loop_pts[-1]) else list(loop_pts)
+            if len(pts) < 3:
+                return None
+
+            # quantize to tolerance grid (native units for signatures at this stage)
+            qq = float(q) * (INCH_TO_MM if assume_mm else 1.0)
+            if not (qq > 0):
+                qq = tol_native
+
+            qpts = []
+            for p in pts:
+                qx = round(float(p[0]) / qq) * qq
+                qy = round(float(p[1]) / qq) * qq
+                qpts.append((qx, qy))
+
+            cx = sum(p[0] for p in qpts) / len(qpts)
+            cy = sum(p[1] for p in qpts) / len(qpts)
+
+            # angle-sort gives a stable representation even if traversal differs
+            qpts_sorted = sorted(qpts, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+
+            return tuple((round(p[0], 6), round(p[1], 6)) for p in qpts_sorted)
 
         def extract_loops_from_adj(adj_in):
             def walk(prefer: str):
@@ -675,6 +716,7 @@ def stl_to_faces_json(stl_bytes: bytes):
             all_loops.extend(walk("min"))
             all_loops.extend(walk("max"))
 
+            # First-pass uniq (exact), then we score/merge with tolerant signatures later.
             uniq = {}
             for lp in all_loops:
                 can = canonicalize_loop_pts(lp)
@@ -684,23 +726,11 @@ def stl_to_faces_json(stl_bytes: bytes):
 
             return list(uniq.values())
 
-        def tolerant_loop_sig(loop_pts):
-            pts = loop_pts[:-1] if (len(loop_pts) > 1 and loop_pts[0] == loop_pts[-1]) else list(loop_pts)
-            if len(pts) < 3:
-                return None
-            qq = float(STL_HEAL_TOL_IN * 0.5) * (INCH_TO_MM if assume_mm else 1.0)
-            if not (qq > 0.0):
-                qq = tol_native
-            qpts = []
-            for p in pts:
-                qx = round(float(p[0]) / qq) * qq
-                qy = round(float(p[1]) / qq) * qq
-                qpts.append((qx, qy))
-            cx = sum(p[0] for p in qpts) / len(qpts)
-            cy = sum(p[1] for p in qpts) / len(qpts)
-            qpts_sorted = sorted(qpts, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
-            return tuple((round(p[0], 6), round(p[1], 6)) for p in qpts_sorted)
-
+        # ---------------------------------------------------------------------
+        # Junction-aware micro-bridge split:
+        # Keep removals only if they increase UNIQUE loop count (tolerant signature).
+        # This targets the missing top-left cavity (spur/junction) without duplicating others.
+        # ---------------------------------------------------------------------
         def bridge_split_junctions(adj_in):
             g = _dd(set)
             for a0, nbs0 in adj_in.items():
@@ -735,6 +765,8 @@ def stl_to_faces_json(stl_bytes: bytes):
             while changed and it < max_iters:
                 it += 1
                 changed = False
+
+                # Evaluate all candidate short edges at junctions; pick the best improvement first.
                 best_improve = 0
                 best_remove = None
 
@@ -748,6 +780,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                         if edge_len(v, u) > BRIDGE_MAX_LEN_NATIVE:
                             continue
 
+                        # try remove
                         g[v].discard(u)
                         g[u].discard(v)
                         if v in g and len(g[v]) == 0:
@@ -759,6 +792,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                         test_u = unique_loop_count(test_adj)
                         improve = test_u - base_u
 
+                        # revert
                         if v not in g:
                             g[v] = set()
                         if u not in g:
@@ -780,6 +814,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                         del g[v]
                     if u in g and len(g[u]) == 0:
                         del g[u]
+
                     base_u += best_improve
                     changed = True
 
@@ -801,6 +836,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                 a2 += pts[i][0] * pts[i + 1][1] - pts[i + 1][0] * pts[i][1]
             return abs(a2) * 0.5
 
+        # Shift to (0,0) (native), then scale to inches
         xs = [p[0] for loop in loops_native for p in loop]
         ys = [p[1] for loop in loops_native for p in loop]
         min_x, min_y = min(xs), min(ys)
@@ -810,8 +846,13 @@ def stl_to_faces_json(stl_bytes: bytes):
             pts_in = [((p[0] - min_x) * scale, (p[1] - min_y) * scale) for p in loop]
             loops_in.append(pts_in)
 
+        # ---------------------------------------------------------------------
+        # 8) Snap + simplify + canonical signature de-dup (enhanced)
+        # CRITICAL FIX: Use perpendicular distance for collinearity to preserve sharp corners
+        # ---------------------------------------------------------------------
         snap_in = max(STL_HEAL_TOL_IN * 0.25, 1e-6)  # inches
-        col_eps = snap_in * snap_in
+        # Use distance threshold for collinearity instead of cross-product squared
+        col_dist_threshold = snap_in * 1.5  # Distance-based collinearity check - reduced from 2.0 to be more conservative
 
         def _snap_pt(p):
             return (
@@ -820,21 +861,28 @@ def stl_to_faces_json(stl_bytes: bytes):
             )
 
         def _simplify_closed(loop_pts):
+            # expects closed or open; returns CLOSED list
             if not loop_pts or len(loop_pts) < 4:
                 return loop_pts
 
             pts = loop_pts[:-1] if loop_pts[0] == loop_pts[-1] else list(loop_pts)
+
+            # snap
             pts = [_snap_pt(p) for p in pts]
 
+            # drop consecutive duplicates
             ded = []
             for p in pts:
                 if not ded or p != ded[-1]:
                     ded.append(p)
             pts = ded
 
+            # ensure minimum
             if len(pts) < 3:
                 return loop_pts
 
+            # remove near-collinear middle points - using perpendicular distance method
+            # This better preserves intentional corners while removing noise
             changed = True
             guard = 0
             while changed and guard < 10:
@@ -850,13 +898,24 @@ def stl_to_faces_json(stl_bytes: bytes):
                     b = pts[i]
                     c = pts[(i + 1) % n]
 
+                    # Calculate perpendicular distance from b to line ac
+                    acx = c[0] - a[0]
+                    acy = c[1] - a[1]
                     abx = b[0] - a[0]
                     aby = b[1] - a[1]
-                    bcx = c[0] - b[0]
-                    bcy = c[1] - b[1]
-
-                    cross = abx * bcy - aby * bcx
-                    if abs(cross) <= col_eps:
+                    
+                    # Perpendicular distance
+                    ac_len_sq = acx * acx + acy * acy
+                    if ac_len_sq < 1e-10:
+                        out.append(b)
+                        continue
+                    
+                    # Distance from point b to line ac
+                    cross = abs(acx * aby - acy * abx)
+                    dist = cross / math.sqrt(ac_len_sq)
+                    
+                    # Only remove if point is very close to the line (truly collinear)
+                    if dist <= col_dist_threshold:
                         changed = True
                         continue
                     out.append(b)
@@ -870,6 +929,7 @@ def stl_to_faces_json(stl_bytes: bytes):
             return pts
 
         def _canonicalize(loop_pts):
+            # loop_pts must be CLOSED
             if len(loop_pts) < 4 or loop_pts[0] != loop_pts[-1]:
                 return loop_pts
 
@@ -890,6 +950,7 @@ def stl_to_faces_json(stl_bytes: bytes):
             chosen = fwd if rep_fwd <= rep_rev else rev
             return chosen + [chosen[0]]
 
+        # Enhanced dedupe: tolerant signature after simplify/canonicalize
         def _tolerant_sig_in(loop_pts):
             pts = loop_pts[:-1] if (len(loop_pts) > 1 and loop_pts[0] == loop_pts[-1]) else list(loop_pts)
             if len(pts) < 3:
@@ -917,65 +978,18 @@ def stl_to_faces_json(stl_bytes: bytes):
         if not loops_can:
             raise ValueError("No valid loops after simplify/dedupe")
 
+        # Drop microscopic loops (noise) — conservative
         min_area_in2 = (STL_HEAL_TOL_IN * STL_HEAL_TOL_IN) * 0.10
         filtered = [l for l in loops_can if poly_area_xy(l) >= min_area_in2]
         if not filtered:
             filtered = loops_can
 
-        # ---------------------------------------------------------------------
-        # FINAL CLUSTER DEDUPE (bbox + centroid + area tolerant)
-        # This is the “last mile” that collapses multiple traces of the same cavity.
-        # Keep the simplest representative (fewest vertices).
-        # ---------------------------------------------------------------------
-        def _loop_bbox(loop_pts):
-            pts = loop_pts[:-1] if (len(loop_pts) > 1 and loop_pts[0] == loop_pts[-1]) else list(loop_pts)
-            xs2 = [p[0] for p in pts]
-            ys2 = [p[1] for p in pts]
-            return (min(xs2), min(ys2), max(xs2), max(ys2))
-
-        def _loop_centroid(loop_pts):
-            pts = loop_pts[:-1] if (len(loop_pts) > 1 and loop_pts[0] == loop_pts[-1]) else list(loop_pts)
-            cx = sum(p[0] for p in pts) / len(pts)
-            cy = sum(p[1] for p in pts) / len(pts)
-            return (cx, cy)
-
-        def _cluster_key(loop_pts):
-            # cluster tolerance in inches
-            q = max(STL_HEAL_TOL_IN * 0.5, 1e-6)
-            x0, y0, x1, y1 = _loop_bbox(loop_pts)
-            cx, cy = _loop_centroid(loop_pts)
-            a = poly_area_xy(loop_pts)
-            bw = x1 - x0
-            bh = y1 - y0
-
-            # quantize to tolerance buckets
-            return (
-                int(round(cx / q)),
-                int(round(cy / q)),
-                int(round(bw / q)),
-                int(round(bh / q)),
-                int(round(a / (q * q))),
-            )
-
-        clustered = {}
-        for lp in filtered:
-            k = _cluster_key(lp)
-            if k not in clustered:
-                clustered[k] = lp
-            else:
-                # keep simplest representative
-                if len(lp) < len(clustered[k]):
-                    clustered[k] = lp
-
-        final_loops = list(clustered.values())
-        if not final_loops:
-            final_loops = filtered
-
-        areas = [poly_area_xy(l) for l in final_loops]
-        outer_idx = int(max(range(len(final_loops)), key=lambda i: areas[i]))
+        # Choose outer as largest area AFTER dedupe/filtering
+        areas = [poly_area_xy(l) for l in filtered]
+        outer_idx = int(max(range(len(filtered)), key=lambda i: areas[i]))
 
         out_loops = []
-        for idx, loop in enumerate(final_loops):
+        for idx, loop in enumerate(filtered):
             pts = [{"x": float(p[0]), "y": float(p[1])} for p in loop]
             out_loops.append({"idx": idx, "closed": True, "points": pts})
 
