@@ -421,7 +421,6 @@ def stl_to_faces_json(stl_bytes: bytes):
     - Angle-based loop walking
     - Junction-aware bridge split (SHORT-edge only) to handle “throat” connections
     - NEW: snap+simplify+canonical signature dedupe (fixes same-loop traced with different point counts/pathing)
-    - NEW (Path A): short-spur-only pruning + bbox-based loop dedupe (fixes residual near-identical duplicates)
     """
     from collections import defaultdict
     import math
@@ -479,7 +478,6 @@ def stl_to_faces_json(stl_bytes: bytes):
 
         min_edge = 0.15 * tol_native
         BRIDGE_MAX_LEN_NATIVE = 3.0 * tol_native
-        SPUR_MAX_LEN_NATIVE = 4.0 * tol_native  # NEW: only prune short dangling spurs
 
         edge_count = defaultdict(int)
         canon = {}
@@ -527,12 +525,7 @@ def stl_to_faces_json(stl_bytes: bytes):
             adj[a].append(b)
             adj[b].append(a)
 
-        def _edge_len(a2, b2):
-            return math.hypot(float(b2[0]) - float(a2[0]), float(b2[1]) - float(a2[1]))
-
-        def prune_spurs_short_only(edges_in):
-            # NEW: ONLY remove leaf edges that are SHORT (spur-like).
-            # This avoids deleting valid boundary structure when a cavity corner has a spur/T-junction.
+        def prune_spurs(edges_in):
             if not edges_in:
                 return []
             g = _dd(set)
@@ -546,13 +539,6 @@ def stl_to_faces_json(stl_bytes: bytes):
                 if v not in g or len(g[v]) != 1:
                     continue
                 u = next(iter(g[v]))
-                if u not in g:
-                    continue
-
-                # Only prune if the dangling edge is short enough to be a spur
-                if _edge_len(v, u) > SPUR_MAX_LEN_NATIVE:
-                    continue
-
                 g[u].discard(v)
                 g[v].discard(u)
                 if v in g and len(g[v]) == 0:
@@ -573,7 +559,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                     out.append(e)
             return out
 
-        pruned_edges = prune_spurs_short_only(boundary_edges)
+        pruned_edges = prune_spurs(boundary_edges)
         if pruned_edges:
             adj = _dd(list)
             for a, b in pruned_edges:
@@ -705,6 +691,21 @@ def stl_to_faces_json(stl_bytes: bytes):
             base_loops = extract_loops_from_adj(to_list_adj(g))
             base_count = len(base_loops)
 
+            def loop_area(loop_pts):
+                pts = loop_pts[:-1] if (len(loop_pts) > 1 and loop_pts[0] == loop_pts[-1]) else list(loop_pts)
+                if len(pts) < 3:
+                    return 0.0
+                a2 = 0.0
+                for i in range(len(pts)):
+                    x1, y1 = pts[i]
+                    x2, y2 = pts[(i + 1) % len(pts)]
+                    a2 += x1 * y2 - x2 * y1
+                return abs(a2) * 0.5
+
+            base_outer_area = 0.0
+            if base_loops:
+                base_outer_area = max(loop_area(lp) for lp in base_loops)
+
             max_iters = 25
             it = 0
             changed = True
@@ -718,8 +719,11 @@ def stl_to_faces_json(stl_bytes: bytes):
                     for u in list(g[v]):
                         if u not in g or v not in g[u]:
                             continue
-                        if edge_len(v, u) > BRIDGE_MAX_LEN_NATIVE:
-                            continue
+
+                        # Path A: do NOT length-gate junction splitting.
+                        # Some “throat” connectors can be longer than our heuristic threshold,
+                        # which prevents valid cavities (like the top-left one) from closing.
+                        # Safety is handled by loop-count + outer-area preservation checks below.
 
                         g[v].discard(u)
                         g[u].discard(v)
@@ -730,8 +734,25 @@ def stl_to_faces_json(stl_bytes: bytes):
 
                         test_loops = extract_loops_from_adj(to_list_adj(g))
                         if len(test_loops) > base_count:
-                            base_count = len(test_loops)
-                            changed = True
+                            # Safety: ensure we didn't damage the outer boundary loop.
+                            # Accept only if the largest loop area stays ~the same.
+                            test_outer = 0.0
+                            if test_loops:
+                                test_outer = max(loop_area(lp) for lp in test_loops)
+
+                            # Allow tiny numeric drift; reject anything that meaningfully shrinks outer.
+                            if base_outer_area > 0 and test_outer < (base_outer_area * 0.98):
+                                # Revert (outer got cut)
+                                if v not in g:
+                                    g[v] = set()
+                                if u not in g:
+                                    g[u] = set()
+                                g[v].add(u)
+                                g[u].add(v)
+                            else:
+                                base_count = len(test_loops)
+                                base_outer_area = max(base_outer_area, test_outer)
+                                changed = True
                         else:
                             if v not in g:
                                 g[v] = set()
@@ -822,8 +843,10 @@ def stl_to_faces_json(stl_bytes: bytes):
                     bcx = c[0] - b[0]
                     bcy = c[1] - b[1]
 
+                    # cross product magnitude squared proxy
                     cross = abx * bcy - aby * bcx
                     if abs(cross) <= col_eps:
+                        # drop b if it’s basically on the same line
                         changed = True
                         continue
                     out.append(b)
@@ -833,6 +856,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                 else:
                     break
 
+            # re-close
             pts = pts + [pts[0]]
             return pts
 
@@ -878,63 +902,7 @@ def stl_to_faces_json(stl_bytes: bytes):
         if not filtered:
             filtered = loops_can
 
-        # ---------------------------------------------------------------------
-        # 9) NEW: bbox-based loop dedupe (tolerant)
-        #    - groups loops by quantized bbox
-        #    - keeps "best" loop per bbox (fewer backtracks, then larger area)
-        # ---------------------------------------------------------------------
-        def _loop_bbox(loop_pts):
-            pts = loop_pts[:-1] if loop_pts and loop_pts[0] == loop_pts[-1] else loop_pts
-            xs2 = [p[0] for p in pts]
-            ys2 = [p[1] for p in pts]
-            return (min(xs2), min(ys2), max(xs2), max(ys2))
-
-        def _q(v, qstep):
-            return round(float(v) / qstep) * qstep
-
-        def _loop_backtracks(loop_pts):
-            # counts A->B->A patterns (common when walker picks wrong branch)
-            if not loop_pts or len(loop_pts) < 4:
-                return 0
-            pts = loop_pts
-            n = len(pts)
-            back = 0
-            for i in range(n - 2):
-                if pts[i] == pts[i + 2]:
-                    back += 1
-            return back
-
-        bbox_q = max(STL_HEAL_TOL_IN, snap_in)  # inches
-        groups = {}
-        for lp in filtered:
-            bx0, by0, bx1, by1 = _loop_bbox(lp)
-            key = (_q(bx0, bbox_q), _q(by0, bbox_q), _q(bx1, bbox_q), _q(by1, bbox_q))
-            groups.setdefault(key, []).append(lp)
-
-        filtered2 = []
-        for key, lps in groups.items():
-            if len(lps) == 1:
-                filtered2.append(lps[0])
-                continue
-
-            # Choose best candidate:
-            # 1) fewer backtracks
-            # 2) larger area
-            # 3) more points (keeps more shape detail when ties)
-            best = None
-            best_score = None
-            for lp in lps:
-                bt = _loop_backtracks(lp)
-                area = poly_area_xy(lp)
-                score = (bt, -area, -len(lp))
-                if best is None or score < best_score:
-                    best = lp
-                    best_score = score
-            filtered2.append(best)
-
-        filtered = filtered2
-
-        # Choose outer as largest area AFTER all dedupe/filtering
+        # Choose outer as largest area AFTER dedupe/filtering
         areas = [poly_area_xy(l) for l in filtered]
         outer_idx = int(max(range(len(filtered)), key=lambda i: areas[i]))
 
