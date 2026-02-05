@@ -578,7 +578,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                 max_steps = max(1000, edge_ct * 2)
 
                 def dir_id(p, q):
-                   grп return (p, q)
+                   return (p, q)
 
                 for start in list(adj_in.keys()):
                     for nxt in adj_in[start]:
