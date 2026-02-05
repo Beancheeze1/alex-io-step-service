@@ -418,9 +418,10 @@ def stl_to_faces_json(stl_bytes: bytes):
     STL → faces_json extraction (top-face boundary edges) with:
     - Corner healing via vertex snapping (tolerance grid)
     - Reduced tolerance (1/64") to avoid collapsing small cavities
-    - Robust planar face-walk (directed-edge) to extract unique closed faces
-      (fixes duplicate loops + captures cavities near junction/spur edges)
-    - Snap+simplify+canonical signature de-dupe (final safety net)
+    - Angle-based loop walking
+    - Junction-aware bridge split (SHORT-edge only) to handle “throat” connections
+    - NEW: snap+simplify+canonical signature dedupe (fixes same-loop traced with different point counts/pathing)
+    - NEW (Path A): short-spur-only pruning + bbox-based loop dedupe (fixes residual near-identical duplicates)
     """
     from collections import defaultdict
     import math
@@ -477,6 +478,8 @@ def stl_to_faces_json(stl_bytes: bytes):
             tol_native = 1e-6
 
         min_edge = 0.15 * tol_native
+        BRIDGE_MAX_LEN_NATIVE = 3.0 * tol_native
+        SPUR_MAX_LEN_NATIVE = 4.0 * tol_native  # NEW: only prune short dangling spurs
 
         edge_count = defaultdict(int)
         canon = {}
@@ -519,7 +522,17 @@ def stl_to_faces_json(stl_bytes: bytes):
 
         from collections import defaultdict as _dd
 
-        def prune_spurs(edges_in):
+        adj = _dd(list)
+        for a, b in boundary_edges:
+            adj[a].append(b)
+            adj[b].append(a)
+
+        def _edge_len(a2, b2):
+            return math.hypot(float(b2[0]) - float(a2[0]), float(b2[1]) - float(a2[1]))
+
+        def prune_spurs_short_only(edges_in):
+            # NEW: ONLY remove leaf edges that are SHORT (spur-like).
+            # This avoids deleting valid boundary structure when a cavity corner has a spur/T-junction.
             if not edges_in:
                 return []
             g = _dd(set)
@@ -533,6 +546,13 @@ def stl_to_faces_json(stl_bytes: bytes):
                 if v not in g or len(g[v]) != 1:
                     continue
                 u = next(iter(g[v]))
+                if u not in g:
+                    continue
+
+                # Only prune if the dangling edge is short enough to be a spur
+                if _edge_len(v, u) > SPUR_MAX_LEN_NATIVE:
+                    continue
+
                 g[u].discard(v)
                 g[v].discard(u)
                 if v in g and len(g[v]) == 0:
@@ -553,97 +573,181 @@ def stl_to_faces_json(stl_bytes: bytes):
                     out.append(e)
             return out
 
-        pruned_edges = prune_spurs(boundary_edges)
-        edges_for_faces = pruned_edges if pruned_edges else boundary_edges
+        pruned_edges = prune_spurs_short_only(boundary_edges)
+        if pruned_edges:
+            adj = _dd(list)
+            for a, b in pruned_edges:
+                adj[a].append(b)
+                adj[b].append(a)
 
-        # ---------------------------------------------------------------------
-        # Robust planar face-walk (directed half-edge traversal)
-        # Each directed edge is assigned to exactly one face => duplicates stop.
-        # ---------------------------------------------------------------------
-        adj = _dd(list)
-        for a, b in edges_for_faces:
-            adj[a].append(b)
-            adj[b].append(a)
+        def turn_angle(prev_pt, cur_pt, nxt_pt):
+            ax = cur_pt[0] - prev_pt[0]
+            ay = cur_pt[1] - prev_pt[1]
+            bx = nxt_pt[0] - cur_pt[0]
+            by = nxt_pt[1] - cur_pt[1]
+            cross = ax * by - ay * bx
+            dot = ax * bx + ay * by
+            ang = math.atan2(cross, dot)
+            if ang < 0:
+                ang += 2.0 * math.pi
+            return ang
 
-        # Sort outgoing neighbors by polar angle for consistent next-edge choice.
-        # Angle from vertex -> neighbor.
-        sorted_nbrs = {}
-        for v, nbs in adj.items():
-            lst = []
-            vx, vy = float(v[0]), float(v[1])
-            for u in nbs:
-                ux, uy = float(u[0]), float(u[1])
-                ang = math.atan2(uy - vy, ux - vx)
-                lst.append((ang, u))
-            lst.sort(key=lambda t: t[0])
-            sorted_nbrs[v] = [u for _, u in lst]
+        def extract_loops_from_adj(adj_in):
+            def walk(prefer: str):
+                used_dir = set()
+                loops_out = []
+                edge_ct = sum(len(v) for v in adj_in.values()) // 2
+                max_steps = max(1000, edge_ct * 2)
 
-        def _next_ccw(v, prev):
-            # At vertex v, coming from prev -> v, pick the neighbor that is
-            # immediately CCW from the incoming direction (standard face-walk).
-            nbs = sorted_nbrs.get(v, [])
-            if not nbs:
-                return None
+                def dir_id(p, q):
+                    return (p, q)
 
-            vx, vy = float(v[0]), float(v[1])
-            px, py = float(prev[0]), float(prev[1])
-            in_ang = math.atan2(py - vy, px - vx)  # direction v->prev (incoming reversed)
-            # We want the neighbor just "after" in_ang in sorted order (CCW).
-            # Find insertion point.
-            # Note: angles in [-pi, pi). Wrap handled by modulo indexing.
-            idx = 0
-            best = None
-            for i, u in enumerate(nbs):
-                ux, uy = float(u[0]), float(u[1])
-                ang = math.atan2(uy - vy, ux - vx)
-                if ang > in_ang:
-                    idx = i
-                    break
-            else:
-                idx = 0
-            best = nbs[idx]
-            return best
+                for start in list(adj_in.keys()):
+                    for nxt in adj_in[start]:
+                        if dir_id(start, nxt) in used_dir:
+                            continue
 
-        visited_dir = set()
+                        loop = [start, nxt]
+                        used_dir.add(dir_id(start, nxt))
 
-        def _walk_face(a, b, max_steps):
-            # walk directed edge a->b until it closes or fails
-            face = [a, b]
-            visited_dir.add((a, b))
-            prev, cur = a, b
-            steps = 0
-            while steps < max_steps:
-                steps += 1
-                nxt = _next_ccw(cur, prev)
-                if nxt is None:
-                    return None
-                if (cur, nxt) in visited_dir:
-                    # If we hit an already-used directed edge, this walk is not a new face.
-                    return None
-                face.append(nxt)
-                visited_dir.add((cur, nxt))
-                prev, cur = cur, nxt
-                if cur == a:
-                    return face
-            return None
+                        prev = start
+                        cur = nxt
+                        steps = 0
 
-        # Conservative step cap
-        edge_ct = sum(len(v) for v in adj.values()) // 2
-        max_steps = max(2000, edge_ct * 4)
+                        while steps < max_steps:
+                            steps += 1
+                            nbrs = adj_in[cur]
+                            if not nbrs:
+                                break
 
-        faces_native = []
-        for a in list(adj.keys()):
-            for b in adj[a]:
-                if (a, b) in visited_dir:
-                    continue
-                f = _walk_face(a, b, max_steps)
-                if f and len(f) >= 4 and f[0] == f[-1]:
-                    faces_native.append(f)
+                            cands = [p for p in nbrs if p != prev]
+                            if not cands:
+                                cands = [prev]
 
-        if not faces_native:
+                            best = None
+                            best_ang = None
+                            for cand in cands:
+                                if dir_id(cur, cand) in used_dir:
+                                    continue
+                                ang = turn_angle(prev, cur, cand)
+                                if best is None:
+                                    best = cand
+                                    best_ang = ang
+                                else:
+                                    if prefer == "min":
+                                        if ang < best_ang:
+                                            best = cand
+                                            best_ang = ang
+                                    else:
+                                        if ang > best_ang:
+                                            best = cand
+                                            best_ang = ang
+
+                            if best is None:
+                                break
+
+                            used_dir.add(dir_id(cur, best))
+                            loop.append(best)
+                            prev, cur = cur, best
+
+                            if cur == start:
+                                break
+
+                        if len(loop) >= 4 and loop[0] == loop[-1]:
+                            loops_out.append(loop)
+
+                return loops_out
+
+            def canonicalize_loop_pts(loop_pts):
+                pts = loop_pts[:-1] if (len(loop_pts) > 1 and loop_pts[0] == loop_pts[-1]) else list(loop_pts)
+                if len(pts) < 3:
+                    return loop_pts
+
+                def rotate_to_min(seq):
+                    mi = min(range(len(seq)), key=lambda i: (seq[i][0], seq[i][1]))
+                    return seq[mi:] + seq[:mi]
+
+                fwd = rotate_to_min(pts)
+                rev = rotate_to_min(list(reversed(pts)))
+                rep_fwd = tuple((round(p[0], 6), round(p[1], 6)) for p in fwd)
+                rep_rev = tuple((round(p[0], 6), round(p[1], 6)) for p in rev)
+                chosen = fwd if rep_fwd <= rep_rev else rev
+                return chosen + [chosen[0]]
+
+            all_loops = []
+            all_loops.extend(walk("min"))
+            all_loops.extend(walk("max"))
+
+            uniq = {}
+            for lp in all_loops:
+                can = canonicalize_loop_pts(lp)
+                sig = tuple((round(p[0], 6), round(p[1], 6)) for p in can)
+                if sig not in uniq:
+                    uniq[sig] = can
+
+            return list(uniq.values())
+
+        def bridge_split_junctions(adj_in):
+            g = _dd(set)
+            for a0, nbs0 in adj_in.items():
+                for b0 in nbs0:
+                    g[a0].add(b0)
+
+            def to_list_adj(g_in):
+                out2 = _dd(list)
+                for a0, nbs0 in g_in.items():
+                    out2[a0] = list(nbs0)
+                return out2
+
+            def edge_len(a0, b0):
+                return math.hypot(float(b0[0]) - float(a0[0]), float(b0[1]) - float(a0[1]))
+
+            base_loops = extract_loops_from_adj(to_list_adj(g))
+            base_count = len(base_loops)
+
+            max_iters = 25
+            it = 0
+            changed = True
+
+            while changed and it < max_iters:
+                it += 1
+                changed = False
+                for v in list(g.keys()):
+                    if v not in g or len(g[v]) < 3:
+                        continue
+                    for u in list(g[v]):
+                        if u not in g or v not in g[u]:
+                            continue
+                        if edge_len(v, u) > BRIDGE_MAX_LEN_NATIVE:
+                            continue
+
+                        g[v].discard(u)
+                        g[u].discard(v)
+                        if v in g and len(g[v]) == 0:
+                            del g[v]
+                        if u in g and len(g[u]) == 0:
+                            del g[u]
+
+                        test_loops = extract_loops_from_adj(to_list_adj(g))
+                        if len(test_loops) > base_count:
+                            base_count = len(test_loops)
+                            changed = True
+                        else:
+                            if v not in g:
+                                g[v] = set()
+                            if u not in g:
+                                g[u] = set()
+                            g[v].add(u)
+                            g[u].add(v)
+
+            return to_list_adj(g)
+
+        adj = bridge_split_junctions(adj)
+        loops_native = extract_loops_from_adj(adj)
+        if not loops_native:
             raise ValueError("Failed to assemble loops from boundary edges")
 
-        def poly_signed_area_xy(pts_xy):
+        def poly_area_xy(pts_xy):
             if len(pts_xy) < 3:
                 return 0.0
             pts = pts_xy
@@ -652,23 +756,20 @@ def stl_to_faces_json(stl_bytes: bytes):
             a2 = 0.0
             for i in range(len(pts) - 1):
                 a2 += pts[i][0] * pts[i + 1][1] - pts[i + 1][0] * pts[i][1]
-            return 0.5 * a2
-
-        def poly_area_xy(pts_xy):
-            return abs(poly_signed_area_xy(pts_xy))
+            return abs(a2) * 0.5
 
         # Shift to (0,0) (native), then scale to inches
-        xs = [p[0] for loop in faces_native for p in loop]
-        ys = [p[1] for loop in faces_native for p in loop]
+        xs = [p[0] for loop in loops_native for p in loop]
+        ys = [p[1] for loop in loops_native for p in loop]
         min_x, min_y = min(xs), min(ys)
 
         loops_in = []
-        for loop in faces_native:
+        for loop in loops_native:
             pts_in = [((p[0] - min_x) * scale, (p[1] - min_y) * scale) for p in loop]
             loops_in.append(pts_in)
 
         # ---------------------------------------------------------------------
-        # Snap + simplify + canonical signature de-dup (final safety net)
+        # 8) Snap + simplify + canonical signature de-dup
         # ---------------------------------------------------------------------
         snap_in = max(STL_HEAL_TOL_IN * 0.25, 1e-6)  # inches
         col_eps = snap_in * snap_in  # cross-product threshold scale
@@ -696,6 +797,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                     ded.append(p)
             pts = ded
 
+            # ensure minimum
             if len(pts) < 3:
                 return loop_pts
 
@@ -776,7 +878,63 @@ def stl_to_faces_json(stl_bytes: bytes):
         if not filtered:
             filtered = loops_can
 
-        # Choose outer as largest absolute area AFTER dedupe/filtering
+        # ---------------------------------------------------------------------
+        # 9) NEW: bbox-based loop dedupe (tolerant)
+        #    - groups loops by quantized bbox
+        #    - keeps "best" loop per bbox (fewer backtracks, then larger area)
+        # ---------------------------------------------------------------------
+        def _loop_bbox(loop_pts):
+            pts = loop_pts[:-1] if loop_pts and loop_pts[0] == loop_pts[-1] else loop_pts
+            xs2 = [p[0] for p in pts]
+            ys2 = [p[1] for p in pts]
+            return (min(xs2), min(ys2), max(xs2), max(ys2))
+
+        def _q(v, qstep):
+            return round(float(v) / qstep) * qstep
+
+        def _loop_backtracks(loop_pts):
+            # counts A->B->A patterns (common when walker picks wrong branch)
+            if not loop_pts or len(loop_pts) < 4:
+                return 0
+            pts = loop_pts
+            n = len(pts)
+            back = 0
+            for i in range(n - 2):
+                if pts[i] == pts[i + 2]:
+                    back += 1
+            return back
+
+        bbox_q = max(STL_HEAL_TOL_IN, snap_in)  # inches
+        groups = {}
+        for lp in filtered:
+            bx0, by0, bx1, by1 = _loop_bbox(lp)
+            key = (_q(bx0, bbox_q), _q(by0, bbox_q), _q(bx1, bbox_q), _q(by1, bbox_q))
+            groups.setdefault(key, []).append(lp)
+
+        filtered2 = []
+        for key, lps in groups.items():
+            if len(lps) == 1:
+                filtered2.append(lps[0])
+                continue
+
+            # Choose best candidate:
+            # 1) fewer backtracks
+            # 2) larger area
+            # 3) more points (keeps more shape detail when ties)
+            best = None
+            best_score = None
+            for lp in lps:
+                bt = _loop_backtracks(lp)
+                area = poly_area_xy(lp)
+                score = (bt, -area, -len(lp))
+                if best is None or score < best_score:
+                    best = lp
+                    best_score = score
+            filtered2.append(best)
+
+        filtered = filtered2
+
+        # Choose outer as largest area AFTER all dedupe/filtering
         areas = [poly_area_xy(l) for l in filtered]
         outer_idx = int(max(range(len(filtered)), key=lambda i: areas[i]))
 
