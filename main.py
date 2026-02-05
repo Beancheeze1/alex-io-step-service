@@ -477,7 +477,6 @@ def stl_to_faces_json(stl_bytes: bytes):
             tol_native = 1e-6
 
         min_edge = 0.15 * tol_native
-        BRIDGE_MAX_LEN_NATIVE = 3.0 * tol_native
 
         edge_count = defaultdict(int)
         canon = {}
@@ -559,13 +558,6 @@ def stl_to_faces_json(stl_bytes: bytes):
                     out.append(e)
             return out
 
-        pruned_edges = prune_spurs(boundary_edges)
-        if pruned_edges:
-            adj = _dd(list)
-            for a, b in pruned_edges:
-                adj[a].append(b)
-                adj[b].append(a)
-
         def turn_angle(prev_pt, cur_pt, nxt_pt):
             ax = cur_pt[0] - prev_pt[0]
             ay = cur_pt[1] - prev_pt[1]
@@ -586,7 +578,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                 max_steps = max(1000, edge_ct * 2)
 
                 def dir_id(p, q):
-                    return (p, q)
+                   grп return (p, q)
 
                 for start in list(adj_in.keys()):
                     for nxt in adj_in[start]:
@@ -673,7 +665,28 @@ def stl_to_faces_json(stl_bytes: bytes):
 
             return list(uniq.values())
 
-        def bridge_split_junctions(adj_in):
+        def _loop_area(loop_pts):
+            pts = loop_pts[:-1] if (len(loop_pts) > 1 and loop_pts[0] == loop_pts[-1]) else list(loop_pts)
+            if len(pts) < 3:
+                return 0.0
+            a2 = 0.0
+            for i in range(len(pts)):
+                x1, y1 = pts[i]
+                x2, y2 = pts[(i + 1) % len(pts)]
+                a2 += x1 * y2 - x2 * y1
+            return abs(a2) * 0.5
+
+        # ---------------------------------------------------------------------
+        # NEW (Path A): Heal small "leaf gaps" BEFORE spur pruning.
+        # If an interior pocket boundary is open (degree-1 endpoints),
+        # prune_spurs will delete it entirely.
+        # We conservatively bridge axis-aligned leaf pairs only when doing so
+        # increases closed-loop count AND preserves outer loop area.
+        # ---------------------------------------------------------------------
+        def heal_leaf_gaps(adj_in):
+            if not adj_in:
+                return adj_in
+
             g = _dd(set)
             for a0, nbs0 in adj_in.items():
                 for b0 in nbs0:
@@ -685,26 +698,107 @@ def stl_to_faces_json(stl_bytes: bytes):
                     out2[a0] = list(nbs0)
                 return out2
 
-            def edge_len(a0, b0):
-                return math.hypot(float(b0[0]) - float(a0[0]), float(b0[1]) - float(a0[1]))
+            def leaves(g_in):
+                return [v for v, nbs0 in g_in.items() if len(nbs0) == 1]
+
+            base_loops = extract_loops_from_adj(to_list_adj(g))
+            base_count = len(base_loops)
+            base_outer_area = max((_loop_area(lp) for lp in base_loops), default=0.0)
+
+            # Conservative limits:
+            # - axis_eps: allow near-horizontal/vertical bridging
+            # - max_bridge: allow bridging up to 5% of overall span, but never less than 3*tolerance
+            axis_eps = 2.0 * tol_native
+            max_bridge = max(3.0 * tol_native, 0.05 * float(raw_span))
+
+            changed = True
+            guard = 0
+            while changed and guard < 25:
+                guard += 1
+                changed = False
+
+                lf = leaves(g)
+                if len(lf) < 2:
+                    break
+
+                best = None  # (dist, a, b)
+                for i in range(len(lf)):
+                    a = lf[i]
+                    for j in range(i + 1, len(lf)):
+                        b = lf[j]
+                        dx = float(b[0]) - float(a[0])
+                        dy = float(b[1]) - float(a[1])
+
+                        # axis-aligned only
+                        if not (abs(dx) <= axis_eps or abs(dy) <= axis_eps):
+                            continue
+
+                        d = math.hypot(dx, dy)
+                        if d <= 0.0 or d > max_bridge:
+                            continue
+
+                        if best is None or d < best[0]:
+                            best = (d, a, b)
+
+                if best is None:
+                    break
+
+                _, a, b = best
+
+                # Tentatively add bridge
+                g[a].add(b)
+                g[b].add(a)
+
+                test_loops = extract_loops_from_adj(to_list_adj(g))
+                test_count = len(test_loops)
+                test_outer = max((_loop_area(lp) for lp in test_loops), default=0.0)
+
+                ok_outer = (base_outer_area <= 0.0) or (test_outer >= (base_outer_area * 0.98))
+                ok_gain = test_count > base_count
+
+                if ok_outer and ok_gain:
+                    base_count = test_count
+                    base_outer_area = max(base_outer_area, test_outer)
+                    changed = True
+                else:
+                    # revert
+                    g[a].discard(b)
+                    g[b].discard(a)
+
+            return to_list_adj(g)
+
+        # Heal leaf gaps first (prevents prune_spurs from deleting valid pocket boundaries)
+        adj = heal_leaf_gaps(adj)
+
+        # Now prune actual spurs (noise) if any remain
+        # Convert adj back to edges for pruning
+        boundary_edges2 = []
+        seen = set()
+        for a0, nbs0 in adj.items():
+            for b0 in nbs0:
+                e = (a0, b0) if a0 <= b0 else (b0, a0)
+                if e in seen:
+                    continue
+                seen.add(e)
+                boundary_edges2.append(e)
+
+        pruned_edges = prune_spurs(boundary_edges2)
+        if pruned_edges:
+            adj = _dd(list)
+            for a, b in pruned_edges:
+                adj[a].append(b)
+                adj[b].append(a)
+
+        def bridge_split_junctions(adj_in):
+            g = _dd(set)
+            for a0, nbs0 in adj_in.items():
+                for b0 in nbs0:
+                    g[a0].add(b0)
 
             base_loops = extract_loops_from_adj(to_list_adj(g))
             base_count = len(base_loops)
 
-            def loop_area(loop_pts):
-                pts = loop_pts[:-1] if (len(loop_pts) > 1 and loop_pts[0] == loop_pts[-1]) else list(loop_pts)
-                if len(pts) < 3:
-                    return 0.0
-                a2 = 0.0
-                for i in range(len(pts)):
-                    x1, y1 = pts[i]
-                    x2, y2 = pts[(i + 1) % len(pts)]
-                    a2 += x1 * y2 - x2 * y1
-                return abs(a2) * 0.5
-
-            base_outer_area = 0.0
-            if base_loops:
-                base_outer_area = max(loop_area(lp) for lp in base_loops)
+            base_outer_area = max((_loop_area(lp) for lp in base_loops), default=0.0)
 
             max_iters = 25
             it = 0
@@ -734,13 +828,8 @@ def stl_to_faces_json(stl_bytes: bytes):
 
                         test_loops = extract_loops_from_adj(to_list_adj(g))
                         if len(test_loops) > base_count:
-                            # Safety: ensure we didn't damage the outer boundary loop.
-                            # Accept only if the largest loop area stays ~the same.
-                            test_outer = 0.0
-                            if test_loops:
-                                test_outer = max(loop_area(lp) for lp in test_loops)
+                            test_outer = max((_loop_area(lp) for lp in test_loops), default=0.0)
 
-                            # Allow tiny numeric drift; reject anything that meaningfully shrinks outer.
                             if base_outer_area > 0 and test_outer < (base_outer_area * 0.98):
                                 # Revert (outer got cut)
                                 if v not in g:
