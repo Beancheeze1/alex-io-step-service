@@ -518,7 +518,8 @@ def stl_to_faces_json(stl_bytes: bytes):
             raise ValueError("No boundary edges found on selected top plane")
 
         from collections import defaultdict as _dd
-                def to_list_adj(g_in):
+
+        def to_list_adj(g_in):
             out2 = _dd(list)
             for a0, nbs0 in g_in.items():
                 out2[a0] = list(nbs0)
@@ -583,7 +584,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                 max_steps = max(1000, edge_ct * 2)
 
                 def dir_id(p, q):
-                   return (p, q)
+                    return (p, q)
 
                 for start in list(adj_in.keys()):
                     for nxt in adj_in[start]:
@@ -697,12 +698,6 @@ def stl_to_faces_json(stl_bytes: bytes):
                 for b0 in nbs0:
                     g[a0].add(b0)
 
-            def to_list_adj(g_in):
-                out2 = _dd(list)
-                for a0, nbs0 in g_in.items():
-                    out2[a0] = list(nbs0)
-                return out2
-
             def leaves(g_in):
                 return [v for v, nbs0 in g_in.items() if len(nbs0) == 1]
 
@@ -710,9 +705,6 @@ def stl_to_faces_json(stl_bytes: bytes):
             base_count = len(base_loops)
             base_outer_area = max((_loop_area(lp) for lp in base_loops), default=0.0)
 
-            # Conservative limits:
-            # - axis_eps: allow near-horizontal/vertical bridging
-            # - max_bridge: allow bridging up to 5% of overall span, but never less than 3*tolerance
             axis_eps = 2.0 * tol_native
             max_bridge = max(3.0 * tol_native, 0.05 * float(raw_span))
 
@@ -734,7 +726,6 @@ def stl_to_faces_json(stl_bytes: bytes):
                         dx = float(b[0]) - float(a[0])
                         dy = float(b[1]) - float(a[1])
 
-                        # axis-aligned only
                         if not (abs(dx) <= axis_eps or abs(dy) <= axis_eps):
                             continue
 
@@ -750,7 +741,6 @@ def stl_to_faces_json(stl_bytes: bytes):
 
                 _, a, b = best
 
-                # Tentatively add bridge
                 g[a].add(b)
                 g[b].add(a)
 
@@ -766,17 +756,13 @@ def stl_to_faces_json(stl_bytes: bytes):
                     base_outer_area = max(base_outer_area, test_outer)
                     changed = True
                 else:
-                    # revert
                     g[a].discard(b)
                     g[b].discard(a)
 
             return to_list_adj(g)
 
-        # Heal leaf gaps first (prevents prune_spurs from deleting valid pocket boundaries)
         adj = heal_leaf_gaps(adj)
 
-        # Now prune actual spurs (noise) if any remain
-        # Convert adj back to edges for pruning
         boundary_edges2 = []
         seen = set()
         for a0, nbs0 in adj.items():
@@ -802,7 +788,6 @@ def stl_to_faces_json(stl_bytes: bytes):
 
             base_loops = extract_loops_from_adj(to_list_adj(g))
             base_count = len(base_loops)
-
             base_outer_area = max((_loop_area(lp) for lp in base_loops), default=0.0)
 
             max_iters = 25
@@ -819,11 +804,6 @@ def stl_to_faces_json(stl_bytes: bytes):
                         if u not in g or v not in g[u]:
                             continue
 
-                        # Path A: do NOT length-gate junction splitting.
-                        # Some “throat” connectors can be longer than our heuristic threshold,
-                        # which prevents valid cavities (like the top-left one) from closing.
-                        # Safety is handled by loop-count + outer-area preservation checks below.
-
                         g[v].discard(u)
                         g[u].discard(v)
                         if v in g and len(g[v]) == 0:
@@ -834,9 +814,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                         test_loops = extract_loops_from_adj(to_list_adj(g))
                         if len(test_loops) > base_count:
                             test_outer = max((_loop_area(lp) for lp in test_loops), default=0.0)
-
                             if base_outer_area > 0 and test_outer < (base_outer_area * 0.98):
-                                # Revert (outer got cut)
                                 if v not in g:
                                     g[v] = set()
                                 if u not in g:
@@ -873,7 +851,6 @@ def stl_to_faces_json(stl_bytes: bytes):
                 a2 += pts[i][0] * pts[i + 1][1] - pts[i + 1][0] * pts[i][1]
             return abs(a2) * 0.5
 
-        # Shift to (0,0) (native), then scale to inches
         xs = [p[0] for loop in loops_native for p in loop]
         ys = [p[1] for loop in loops_native for p in loop]
         min_x, min_y = min(xs), min(ys)
@@ -883,11 +860,8 @@ def stl_to_faces_json(stl_bytes: bytes):
             pts_in = [((p[0] - min_x) * scale, (p[1] - min_y) * scale) for p in loop]
             loops_in.append(pts_in)
 
-        # ---------------------------------------------------------------------
-        # 8) Snap + simplify + canonical signature de-dup
-        # ---------------------------------------------------------------------
         snap_in = max(STL_HEAL_TOL_IN * 0.25, 1e-6)  # inches
-        col_eps = snap_in * snap_in  # cross-product threshold scale
+        col_eps = snap_in * snap_in
 
         def _snap_pt(p):
             return (
@@ -896,27 +870,21 @@ def stl_to_faces_json(stl_bytes: bytes):
             )
 
         def _simplify_closed(loop_pts):
-            # expects closed or open; returns CLOSED list
             if not loop_pts or len(loop_pts) < 4:
                 return loop_pts
 
             pts = loop_pts[:-1] if loop_pts[0] == loop_pts[-1] else list(loop_pts)
-
-            # snap
             pts = [_snap_pt(p) for p in pts]
 
-            # drop consecutive duplicates
             ded = []
             for p in pts:
                 if not ded or p != ded[-1]:
                     ded.append(p)
             pts = ded
 
-            # ensure minimum
             if len(pts) < 3:
                 return loop_pts
 
-            # remove near-collinear middle points
             changed = True
             guard = 0
             while changed and guard < 10:
@@ -937,10 +905,8 @@ def stl_to_faces_json(stl_bytes: bytes):
                     bcx = c[0] - b[0]
                     bcy = c[1] - b[1]
 
-                    # cross product magnitude squared proxy
                     cross = abx * bcy - aby * bcx
                     if abs(cross) <= col_eps:
-                        # drop b if it’s basically on the same line
                         changed = True
                         continue
                     out.append(b)
@@ -950,12 +916,10 @@ def stl_to_faces_json(stl_bytes: bytes):
                 else:
                     break
 
-            # re-close
             pts = pts + [pts[0]]
             return pts
 
         def _canonicalize(loop_pts):
-            # loop_pts must be CLOSED
             if len(loop_pts) < 4 or loop_pts[0] != loop_pts[-1]:
                 return loop_pts
 
@@ -990,13 +954,11 @@ def stl_to_faces_json(stl_bytes: bytes):
         if not loops_can:
             raise ValueError("No valid loops after simplify/dedupe")
 
-        # Drop microscopic loops (noise) — conservative
         min_area_in2 = (STL_HEAL_TOL_IN * STL_HEAL_TOL_IN) * 0.10
         filtered = [l for l in loops_can if poly_area_xy(l) >= min_area_in2]
         if not filtered:
             filtered = loops_can
 
-        # Choose outer as largest area AFTER dedupe/filtering
         areas = [poly_area_xy(l) for l in filtered]
         outer_idx = int(max(range(len(filtered)), key=lambda i: areas[i]))
 
