@@ -421,9 +421,15 @@ def stl_to_faces_json(stl_bytes: bytes):
     - Angle-based loop walking
     - Junction-aware bridge split (SHORT-edge only) to handle “throat” connections
     - NEW: snap+simplify+canonical signature dedupe (fixes same-loop traced with different point counts/pathing)
+
+    FIXES (this chat):
+    - Blocking A: tolerant, vertex-count-independent dedupe to stop duplicate stacked cavities.
+    - Blocking B: junction micro-bridge split scored by UNIQUE loop count (tolerant signature),
+      plus conservative spur pruning (only short spurs) to preserve true cavity boundaries.
     """
     from collections import defaultdict
     import math
+    from collections import deque
 
     with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as tmp:
         stl_path = tmp.name
@@ -525,6 +531,10 @@ def stl_to_faces_json(stl_bytes: bytes):
             adj[a].append(b)
             adj[b].append(a)
 
+        # ---------------------------------------------------------------------
+        # Conservative spur pruning: only remove SHORT dangling spurs.
+        # This preserves real cavity edges while still removing “wild” corner spurs.
+        # ---------------------------------------------------------------------
         def prune_spurs(edges_in):
             if not edges_in:
                 return []
@@ -533,12 +543,20 @@ def stl_to_faces_json(stl_bytes: bytes):
                 g[a2].add(b2)
                 g[b2].add(a2)
 
+            def _elen(a2, b2):
+                return math.hypot(float(b2[0]) - float(a2[0]), float(b2[1]) - float(a2[1]))
+
             leaves = [v for v, nbs in g.items() if len(nbs) == 1]
             while leaves:
                 v = leaves.pop()
                 if v not in g or len(g[v]) != 1:
                     continue
                 u = next(iter(g[v]))
+
+                # ONLY prune if the dangling edge is short (spur / micro-bridge).
+                if _elen(v, u) > BRIDGE_MAX_LEN_NATIVE:
+                    continue
+
                 g[u].discard(v)
                 g[v].discard(u)
                 if v in g and len(g[v]) == 0:
@@ -577,6 +595,35 @@ def stl_to_faces_json(stl_bytes: bytes):
             if ang < 0:
                 ang += 2.0 * math.pi
             return ang
+
+        # ---------------------------------------------------------------------
+        # Tolerant loop signature (vertex-count independent) for UNIQUE counting
+        # and final dedupe. This is the core fix for duplicate stacked cavities.
+        # ---------------------------------------------------------------------
+        def tolerant_loop_sig(loop_pts, q=STL_HEAL_TOL_IN * 0.5):
+            # loop_pts may be closed or open; operate on unique vertices only
+            pts = loop_pts[:-1] if (len(loop_pts) > 1 and loop_pts[0] == loop_pts[-1]) else list(loop_pts)
+            if len(pts) < 3:
+                return None
+
+            # quantize to tolerance grid (native units for signatures at this stage)
+            qq = float(q) * (INCH_TO_MM if assume_mm else 1.0)
+            if not (qq > 0):
+                qq = tol_native
+
+            qpts = []
+            for p in pts:
+                qx = round(float(p[0]) / qq) * qq
+                qy = round(float(p[1]) / qq) * qq
+                qpts.append((qx, qy))
+
+            cx = sum(p[0] for p in qpts) / len(qpts)
+            cy = sum(p[1] for p in qpts) / len(qpts)
+
+            # angle-sort gives a stable representation even if traversal differs
+            qpts_sorted = sorted(qpts, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+
+            return tuple((round(p[0], 6), round(p[1], 6)) for p in qpts_sorted)
 
         def extract_loops_from_adj(adj_in):
             def walk(prefer: str):
@@ -664,6 +711,7 @@ def stl_to_faces_json(stl_bytes: bytes):
             all_loops.extend(walk("min"))
             all_loops.extend(walk("max"))
 
+            # First-pass uniq (exact), then we score/merge with tolerant signatures later.
             uniq = {}
             for lp in all_loops:
                 can = canonicalize_loop_pts(lp)
@@ -673,6 +721,11 @@ def stl_to_faces_json(stl_bytes: bytes):
 
             return list(uniq.values())
 
+        # ---------------------------------------------------------------------
+        # Junction-aware micro-bridge split:
+        # Keep removals only if they increase UNIQUE loop count (tolerant signature).
+        # This targets the missing top-left cavity (spur/junction) without duplicating others.
+        # ---------------------------------------------------------------------
         def bridge_split_junctions(adj_in):
             g = _dd(set)
             for a0, nbs0 in adj_in.items():
@@ -688,25 +741,41 @@ def stl_to_faces_json(stl_bytes: bytes):
             def edge_len(a0, b0):
                 return math.hypot(float(b0[0]) - float(a0[0]), float(b0[1]) - float(a0[1]))
 
-            base_loops = extract_loops_from_adj(to_list_adj(g))
-            base_count = len(base_loops)
+            def unique_loop_count(adj_test):
+                loops = extract_loops_from_adj(adj_test)
+                seen = set()
+                for lp in loops:
+                    s = tolerant_loop_sig(lp)
+                    if s is not None:
+                        seen.add(s)
+                return len(seen)
 
-            max_iters = 25
+            base_adj = to_list_adj(g)
+            base_u = unique_loop_count(base_adj)
+
+            max_iters = 40
             it = 0
             changed = True
 
             while changed and it < max_iters:
                 it += 1
                 changed = False
+
+                # Evaluate all candidate short edges at junctions; pick the best improvement first.
+                best_improve = 0
+                best_remove = None
+
                 for v in list(g.keys()):
                     if v not in g or len(g[v]) < 3:
                         continue
+
                     for u in list(g[v]):
                         if u not in g or v not in g[u]:
                             continue
                         if edge_len(v, u) > BRIDGE_MAX_LEN_NATIVE:
                             continue
 
+                        # try remove
                         g[v].discard(u)
                         g[u].discard(v)
                         if v in g and len(g[v]) == 0:
@@ -714,17 +783,35 @@ def stl_to_faces_json(stl_bytes: bytes):
                         if u in g and len(g[u]) == 0:
                             del g[u]
 
-                        test_loops = extract_loops_from_adj(to_list_adj(g))
-                        if len(test_loops) > base_count:
-                            base_count = len(test_loops)
-                            changed = True
-                        else:
-                            if v not in g:
-                                g[v] = set()
-                            if u not in g:
-                                g[u] = set()
-                            g[v].add(u)
-                            g[u].add(v)
+                        test_adj = to_list_adj(g)
+                        test_u = unique_loop_count(test_adj)
+                        improve = test_u - base_u
+
+                        # revert
+                        if v not in g:
+                            g[v] = set()
+                        if u not in g:
+                            g[u] = set()
+                        g[v].add(u)
+                        g[u].add(v)
+
+                        if improve > best_improve:
+                            best_improve = improve
+                            best_remove = (v, u)
+
+                if best_remove and best_improve > 0:
+                    v, u = best_remove
+                    if v in g and u in g[v]:
+                        g[v].discard(u)
+                    if u in g and v in g[u]:
+                        g[u].discard(v)
+                    if v in g and len(g[v]) == 0:
+                        del g[v]
+                    if u in g and len(g[u]) == 0:
+                        del g[u]
+
+                    base_u += best_improve
+                    changed = True
 
             return to_list_adj(g)
 
@@ -755,7 +842,7 @@ def stl_to_faces_json(stl_bytes: bytes):
             loops_in.append(pts_in)
 
         # ---------------------------------------------------------------------
-        # 8) Snap + simplify + canonical signature de-dup
+        # 8) Snap + simplify + canonical signature de-dup (enhanced)
         # ---------------------------------------------------------------------
         snap_in = max(STL_HEAL_TOL_IN * 0.25, 1e-6)  # inches
         col_eps = snap_in * snap_in  # cross-product threshold scale
@@ -808,10 +895,8 @@ def stl_to_faces_json(stl_bytes: bytes):
                     bcx = c[0] - b[0]
                     bcy = c[1] - b[1]
 
-                    # cross product magnitude squared proxy
                     cross = abx * bcy - aby * bcx
                     if abs(cross) <= col_eps:
-                        # drop b if it’s basically on the same line
                         changed = True
                         continue
                     out.append(b)
@@ -821,7 +906,6 @@ def stl_to_faces_json(stl_bytes: bytes):
                 else:
                     break
 
-            # re-close
             pts = pts + [pts[0]]
             return pts
 
@@ -847,13 +931,27 @@ def stl_to_faces_json(stl_bytes: bytes):
             chosen = fwd if rep_fwd <= rep_rev else rev
             return chosen + [chosen[0]]
 
+        # Enhanced dedupe: tolerant signature after simplify/canonicalize
+        def _tolerant_sig_in(loop_pts):
+            pts = loop_pts[:-1] if (len(loop_pts) > 1 and loop_pts[0] == loop_pts[-1]) else list(loop_pts)
+            if len(pts) < 3:
+                return None
+            q = max(STL_HEAL_TOL_IN * 0.5, 1e-6)
+            qpts = [(round(p[0] / q) * q, round(p[1] / q) * q) for p in pts]
+            cx = sum(p[0] for p in qpts) / len(qpts)
+            cy = sum(p[1] for p in qpts) / len(qpts)
+            qpts_sorted = sorted(qpts, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+            return tuple((round(p[0], 6), round(p[1], 6)) for p in qpts_sorted)
+
         dedup = {}
         for lp in loops_in:
             simp = _simplify_closed(lp)
             can = _canonicalize(simp)
             if len(can) < 4 or can[0] != can[-1]:
                 continue
-            sig = tuple((round(p[0], 6), round(p[1], 6)) for p in can)
+            sig = _tolerant_sig_in(can)
+            if sig is None:
+                continue
             if sig not in dedup:
                 dedup[sig] = can
 
