@@ -488,7 +488,7 @@ def stl_to_faces_json(stl_bytes: bytes):
             tol_native = 1e-6
 
         min_edge = 0.15 * tol_native
-        BRIDGE_MAX_LEN_NATIVE = 3.0 * tol_native
+        BRIDGE_MAX_LEN_NATIVE = 5.0 * tol_native  # Increased from 3.0 to catch more junction bridges
 
         edge_count = defaultdict(int)
         canon = {}
@@ -558,8 +558,9 @@ def stl_to_faces_json(stl_bytes: bytes):
                     continue
                 u = next(iter(g[v]))
 
-                # ONLY prune if the dangling edge is short (spur / micro-bridge).
-                if _elen(v, u) > BRIDGE_MAX_LEN_NATIVE:
+                # ONLY prune if the dangling edge is VERY short (micro spur only).
+                # Increased threshold slightly to preserve more real boundaries
+                if _elen(v, u) > BRIDGE_MAX_LEN_NATIVE * 0.5:  # Changed from > BRIDGE_MAX_LEN_NATIVE
                     continue
 
                 g[u].discard(v)
@@ -758,7 +759,7 @@ def stl_to_faces_json(stl_bytes: bytes):
             base_adj = to_list_adj(g)
             base_u = unique_loop_count(base_adj)
 
-            max_iters = 40
+            max_iters = 100  # Increased from 40 to be more thorough
             it = 0
             changed = True
 
@@ -771,7 +772,7 @@ def stl_to_faces_json(stl_bytes: bytes):
                 best_remove = None
 
                 for v in list(g.keys()):
-                    if v not in g or len(g[v]) < 3:
+                    if v not in g or len(g[v]) < 2:  # Changed from < 3 to catch more junctions
                         continue
 
                     for u in list(g[v]):
