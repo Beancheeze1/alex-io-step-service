@@ -43,6 +43,11 @@
 # NEW (Path A) - THROUGH CUT:
 # - If a cavity depth is >= layer thickness, cut through the full layer.
 # - Implemented by setting cut depth to T_mm + small epsilon (ensures exit).
+#
+# NEW (Path A) - POLYGON CAVITIES:
+# - If shape == "poly" and points[] is present (0..1 normalized, top-left origin),
+#   we cut the pocket using that polygon instead of a rectangle.
+# - Points are flipped to CAD Y-up coordinates and scaled into mm.
 
 from typing import List, Optional
 import os
@@ -64,6 +69,12 @@ DEFAULT_OUTER_ROUND_IN = 0.25
 STL_HEAL_TOL_IN = 0.015625  # 1/64"
 
 
+class Point2D(BaseModel):
+    # Normalized coordinates in editor space: x,y in [0..1], origin top-left (y down)
+    x: float = Field(..., ge=0.0, le=1.0)
+    y: float = Field(..., ge=0.0, le=1.0)
+
+
 class Cavity(BaseModel):
     lengthIn: float
     widthIn: float
@@ -76,6 +87,9 @@ class Cavity(BaseModel):
 
     cornerRadiusIn: Optional[float] = None
     corner_radius_in: Optional[float] = None
+
+    # NEW: polygon cavities (normalized points, top-left origin)
+    points: Optional[List[Point2D]] = None
 
     @validator("lengthIn", "widthIn", "depthIn")
     def positive(cls, v: float) -> float:
@@ -349,6 +363,69 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
                         .circle(r_mm)
                         .extrude(cav_D)
                     )
+
+                elif shape == "poly" and cav.points is not None and len(cav.points) >= 3:
+                    # Points are normalized [0..1] in editor space (top-left origin).
+                    # Convert to CAD XY in mm with bottom-left origin (Y-up).
+                    pts_mm: List[tuple] = []
+
+                    last = None
+                    for p in cav.points:
+                        try:
+                            xn = float(p.x)
+                            yn = float(p.y)
+                        except Exception:
+                            continue
+
+                        if xn < 0.0:
+                            xn = 0.0
+                        if xn > 1.0:
+                            xn = 1.0
+                        if yn < 0.0:
+                            yn = 0.0
+                        if yn > 1.0:
+                            yn = 1.0
+
+                        x_mm = xn * L_mm
+                        y_mm = (1.0 - yn) * W_mm  # flip Y
+
+                        # clamp to block bounds
+                        x_mm = max(0.0, min(L_mm, x_mm))
+                        y_mm = max(0.0, min(W_mm, y_mm))
+
+                        pt = (x_mm, y_mm)
+                        if last is None or pt != last:
+                            pts_mm.append(pt)
+                            last = pt
+
+                    # Need at least 3 distinct points
+                    if len(pts_mm) >= 3:
+                        cavity = (
+                            cq.Workplane("XY")
+                            .workplane(offset=z_cut)
+                            .polyline(pts_mm)
+                            .close()
+                            .extrude(cav_D)
+                        )
+                    else:
+                        # Fallback to rect if points are degenerate
+                        cav_L = float(cav.lengthIn) * INCH_TO_MM
+                        cav_W = float(cav.widthIn) * INCH_TO_MM
+                        if cav_L >= L_mm or cav_W >= W_mm:
+                            continue
+
+                        x_left = cav.x * L_mm
+                        y_top_cad = W_mm * (1.0 - cav.y) - cav_W
+
+                        x_left = max(0.0, min(L_mm - cav_L, x_left))
+                        y_top_cad = max(0.0, min(W_mm - cav_W, y_top_cad))
+
+                        cavity = (
+                            cq.Workplane("XY")
+                            .box(cav_L, cav_W, cav_D, centered=(False, False, False))
+                            .translate((x_left, y_top_cad, z_cut))
+                        )
+
                 else:
                     cav_L = float(cav.lengthIn) * INCH_TO_MM
                     cav_W = float(cav.widthIn) * INCH_TO_MM
