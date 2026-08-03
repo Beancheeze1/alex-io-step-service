@@ -48,8 +48,39 @@
 # - If shape == "poly" and points[] is present (0..1 normalized, top-left origin),
 #   we cut the pocket using that polygon instead of a rectangle.
 # - Points are flipped to CAD Y-up coordinates and scaled into mm.
+#
+# NEW - ISLAND SUPPORT:
+# - A cavity may carry islands[]: raised, uncut regions inside its footprint
+#   (the frontend calls these "nestedCavities" and renders them with
+#   fillRule="evenodd" -- an island is the OPPOSITE of a deeper nested cut).
+# - Implemented as cut-then-union-back, NOT a single hole-in-face extrusion:
+#   after cutting the parent cavity as usual, each island's polygon is
+#   extruded from the cavity floor (z_cut) back up to the layer's original
+#   top surface (z_top) and unioned into the solid. Full-height boss only
+#   (no partial-height islands in this version).
+# - Ordering is critical: island union happens immediately after ITS OWN
+#   cavity's cut, in the same per-cavity loop iteration -- not in a second
+#   pass after all cavities are cut -- so a later sibling cavity can never
+#   slice into an island before it's been restored.
+#
+# NEW - PRE-FLIGHT VALIDATION (validate_layout):
+# - Runs BEFORE any CAD kernel calls (separate from the existing per-cavity
+#   try/except "SAFE GEOMETRY" swallowing, which is for genuine unexpected
+#   CAD kernel failures). Raises ValueError -> HTTP 400 with a clear message
+#   for:
+#     - an island not fully contained within its parent cavity's footprint
+#     - a wall/gap thinner than MIN_WALL_IN, between sibling cavities in the
+#       same layer, or between an island and its parent cavity's wall
+#   Sibling cavities that are legitimately fully nested (the existing
+#   "stepped pocket" feature) are exempt from the gap check -- there is no
+#   side wall between them, only a floor step.
+# - This is a heuristic guard, not a fix for the underlying OCCT boolean-cut
+#   robustness issue with closely-spaced features (that remains separate,
+#   future work). It exists only to fail loudly instead of silently
+#   exporting degenerate geometry.
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
+import math
 import os
 import tempfile
 
@@ -65,6 +96,15 @@ THROUGH_CUT_EPS_MM = 0.25
 FILLET_EPS_MM = 1e-3
 DEFAULT_OUTER_ROUND_IN = 0.25
 
+# MIN-WALL VALIDATION GUARD: minimum allowed gap (inches) between two cavity
+# footprints in the same layer (sibling cavities, or an island and its
+# parent cavity's wall). Chosen conservatively above the ~0.1in wall
+# thickness observed to trigger boolean-cut instability in this service.
+# This is a heuristic pre-flight check, not a fix for that instability --
+# see the ISLAND SUPPORT / PRE-FLIGHT VALIDATION notes above.
+MIN_WALL_IN = 0.125
+MIN_WALL_MM = MIN_WALL_IN * INCH_TO_MM
+
 # STL corner heal tolerance (inches). Used only in stl_to_faces_json().
 STL_HEAL_TOL_IN = 0.015625  # 1/64"
 
@@ -73,6 +113,24 @@ class Point2D(BaseModel):
     # Normalized coordinates in editor space: x,y in [0..1], origin top-left (y down)
     x: float = Field(..., ge=0.0, le=1.0)
     y: float = Field(..., ge=0.0, le=1.0)
+
+
+class Island(BaseModel):
+    """
+    A raised, uncut region ("boss") inside a parent cavity's footprint --
+    the inverse of a cavity cutout. Rises from the parent cavity's cut floor
+    back up to the layer's original top surface (full-height boss only; no
+    partial-height islands in this version). Points use the same normalized
+    [0..1], top-left-origin convention as Cavity.points.
+    """
+
+    points: List[Point2D]
+
+    @validator("points")
+    def min_points(cls, v: List[Point2D]) -> List[Point2D]:
+        if len(v) < 3:
+            raise ValueError("Island needs at least 3 points")
+        return v
 
 
 class Cavity(BaseModel):
@@ -90,6 +148,9 @@ class Cavity(BaseModel):
 
     # NEW: polygon cavities (normalized points, top-left origin)
     points: Optional[List[Point2D]] = None
+
+    # NEW: islands (raised, uncut bosses within this cavity's footprint)
+    islands: Optional[List[Island]] = None
 
     @validator("lengthIn", "widthIn", "depthIn")
     def positive(cls, v: float) -> float:
@@ -213,6 +274,289 @@ def _resolve_round_for_layer(layer: FoamLayer) -> bool:
 def _resolve_round_radius_in(layer: FoamLayer) -> float:
     v = _safe_pos(layer.roundRadiusIn) or _safe_pos(layer.round_radius_in)
     return float(v) if v is not None else DEFAULT_OUTER_ROUND_IN
+
+
+def _normalize_poly_points_mm(points, L_mm: float, W_mm: float) -> List[Tuple[float, float]]:
+    """
+    Convert a list of normalized [0..1] editor-space points (top-left
+    origin) into CAD mm space (bottom-left origin, Y-up), matching the same
+    convention used for cavity.points in build_cad_from_layout's poly-cavity
+    branch. Clamps to block bounds and drops consecutive duplicate points.
+
+    Used by island validation and island geometry construction. Kept as an
+    independent implementation from the existing poly-cavity cut branch
+    (deliberately not shared/refactored) so this addition cannot perturb the
+    already-working cavity cut code path.
+    """
+    pts_mm: List[Tuple[float, float]] = []
+    last = None
+    for p in points:
+        try:
+            xn = float(p.x)
+            yn = float(p.y)
+        except Exception:
+            continue
+
+        xn = max(0.0, min(1.0, xn))
+        yn = max(0.0, min(1.0, yn))
+
+        x_mm = xn * L_mm
+        y_mm = (1.0 - yn) * W_mm
+
+        x_mm = max(0.0, min(L_mm, x_mm))
+        y_mm = max(0.0, min(W_mm, y_mm))
+
+        pt = (x_mm, y_mm)
+        if last is None or pt != last:
+            pts_mm.append(pt)
+            last = pt
+
+    return pts_mm
+
+
+def _cavity_footprint_mm(cav: "Cavity", L_mm: float, W_mm: float) -> dict:
+    """
+    Approximate 2D footprint of a cavity's cut region in CAD mm space
+    (bottom-left origin, Y-up), for the pre-flight validation pass ONLY.
+
+    Deliberately mirrors -- but does not share code with -- the placement
+    math in build_cad_from_layout, so validation can never perturb the
+    existing, working cut/extrude code paths.
+
+    Rounded-rect footprints are approximated by their sharp-corner bounding
+    rectangle (slightly larger than the true filleted cut): a deliberately
+    conservative approximation that can only make the guard MORE cautious
+    near rounded corners, never less.
+    """
+    shape = (cav.shape or "rect").strip().lower()
+
+    if shape == "circle":
+        dia_in = cav.diameterIn or min(cav.lengthIn, cav.widthIn)
+        r_mm = (float(dia_in) * INCH_TO_MM) / 2.0
+
+        x_left = cav.x * L_mm
+        y_top_cad = W_mm * (1.0 - cav.y) - (2.0 * r_mm)
+        x_left = max(0.0, min(L_mm - 2.0 * r_mm, x_left))
+        y_top_cad = max(0.0, min(W_mm - 2.0 * r_mm, y_top_cad))
+
+        cx = x_left + r_mm
+        cy = y_top_cad + r_mm
+        return {"type": "circle", "cx": cx, "cy": cy, "r": r_mm}
+
+    if shape == "poly" and cav.points is not None and len(cav.points) >= 3:
+        pts_mm = _normalize_poly_points_mm(cav.points, L_mm, W_mm)
+        if len(pts_mm) >= 3:
+            return {"type": "poly", "pts": pts_mm}
+        # degenerate poly points -> fall through to rect approximation below
+
+    cav_L = float(cav.lengthIn) * INCH_TO_MM
+    cav_W = float(cav.widthIn) * INCH_TO_MM
+
+    x_left = cav.x * L_mm
+    y_top_cad = W_mm * (1.0 - cav.y) - cav_W
+    x_left = max(0.0, min(L_mm - cav_L, x_left))
+    y_top_cad = max(0.0, min(W_mm - cav_W, y_top_cad))
+
+    pts = [
+        (x_left, y_top_cad),
+        (x_left + cav_L, y_top_cad),
+        (x_left + cav_L, y_top_cad + cav_W),
+        (x_left, y_top_cad + cav_W),
+    ]
+    return {"type": "poly", "pts": pts}
+
+
+def _point_in_poly(pt: Tuple[float, float], poly_pts: List[Tuple[float, float]]) -> bool:
+    """Standard ray-casting point-in-polygon test. poly_pts need not be closed."""
+    pts = poly_pts[:-1] if (len(poly_pts) > 1 and poly_pts[0] == poly_pts[-1]) else poly_pts
+    n = len(pts)
+    if n < 3:
+        return False
+
+    x, y = pt
+    inside = False
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        if (y1 > y) != (y2 > y):
+            x_int = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+            if x < x_int:
+                inside = not inside
+    return inside
+
+
+def _point_in_footprint(pt: Tuple[float, float], fp: dict) -> bool:
+    if fp["type"] == "circle":
+        dx = pt[0] - fp["cx"]
+        dy = pt[1] - fp["cy"]
+        return (dx * dx + dy * dy) <= (fp["r"] * fp["r"]) + 1e-9
+    return _point_in_poly(pt, fp["pts"])
+
+
+def _polygon_fully_inside(pts: List[Tuple[float, float]], fp: dict) -> bool:
+    return all(_point_in_footprint(p, fp) for p in pts)
+
+
+def _footprint_fully_inside(inner_fp: dict, outer_fp: dict) -> bool:
+    """
+    True if inner_fp is entirely inside outer_fp -- the legitimate
+    "stepped pocket" case (a smaller/deeper cavity nested inside a larger,
+    shallower one). Such pairs share no side wall and are exempt from the
+    sibling min-wall gap check.
+    """
+    if inner_fp["type"] == "poly":
+        return _polygon_fully_inside(inner_fp["pts"], outer_fp)
+
+    # circle: sample the center plus 8 points around the circumference
+    cx, cy, r = inner_fp["cx"], inner_fp["cy"], inner_fp["r"]
+    sample_pts = [
+        (cx + r * math.cos(a), cy + r * math.sin(a))
+        for a in (i * math.pi / 4.0 for i in range(8))
+    ]
+    sample_pts.append((cx, cy))
+    return all(_point_in_footprint(p, outer_fp) for p in sample_pts)
+
+
+def _point_to_seg_dist(p: Tuple[float, float], a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    ax, ay = a
+    bx, by = b
+    px, py = p
+    dx, dy = bx - ax, by - ay
+    len2 = dx * dx + dy * dy
+    if len2 <= 1e-15:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / len2))
+    cx_, cy_ = ax + t * dx, ay + t * dy
+    return math.hypot(px - cx_, py - cy_)
+
+
+def _seg_seg_dist(
+    p1: Tuple[float, float],
+    p2: Tuple[float, float],
+    q1: Tuple[float, float],
+    q2: Tuple[float, float],
+) -> float:
+    """Minimum distance between segments p1-p2 and q1-q2 (2D). 0.0 if they cross/touch."""
+
+    def ccw(a, b, c):
+        return (c[1] - a[1]) * (b[0] - a[0]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    d1 = ccw(q1, q2, p1)
+    d2 = ccw(q1, q2, p2)
+    d3 = ccw(p1, p2, q1)
+    d4 = ccw(p1, p2, q2)
+    if ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0)) and d1 != 0 and d2 != 0:
+        return 0.0
+
+    return min(
+        _point_to_seg_dist(p1, q1, q2),
+        _point_to_seg_dist(p2, q1, q2),
+        _point_to_seg_dist(q1, p1, p2),
+        _point_to_seg_dist(q2, p1, p2),
+    )
+
+
+def _poly_edges(pts: List[Tuple[float, float]]) -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    p = pts[:-1] if (len(pts) > 1 and pts[0] == pts[-1]) else list(pts)
+    n = len(p)
+    if n < 2:
+        return []
+    return [(p[i], p[(i + 1) % n]) for i in range(n)]
+
+
+def _min_gap_mm(fp_a: dict, fp_b: dict) -> float:
+    """
+    Approximate minimum gap (mm) between two footprints. <= 0.0 if they
+    overlap/touch. Heuristic for the min-wall guard, not exact CAD
+    tolerancing.
+    """
+    if fp_a["type"] == "circle" and fp_b["type"] == "circle":
+        d = math.hypot(fp_a["cx"] - fp_b["cx"], fp_a["cy"] - fp_b["cy"])
+        return d - fp_a["r"] - fp_b["r"]
+
+    if fp_a["type"] == "circle" or fp_b["type"] == "circle":
+        circle_fp, poly_fp = (fp_a, fp_b) if fp_a["type"] == "circle" else (fp_b, fp_a)
+        cx, cy, r = circle_fp["cx"], circle_fp["cy"], circle_fp["r"]
+        edges = _poly_edges(poly_fp["pts"])
+        if not edges:
+            return float("inf")
+        best = min(_point_to_seg_dist((cx, cy), a, b) for a, b in edges)
+        if _point_in_poly((cx, cy), poly_fp["pts"]):
+            return -best - r
+        return best - r
+
+    edges_a = _poly_edges(fp_a["pts"])
+    edges_b = _poly_edges(fp_b["pts"])
+    if not edges_a or not edges_b:
+        return float("inf")
+    return min(_seg_seg_dist(a1, a2, b1, b2) for a1, a2 in edges_a for b1, b2 in edges_b)
+
+
+def validate_layout(layout: "Layout") -> None:
+    """
+    Pre-flight validation, run BEFORE any CAD kernel calls. Raises
+    ValueError (caller maps this to HTTP 400) with a clear, human-readable
+    message for:
+      - a malformed island (fewer than 3 distinct points, or not fully
+        contained within its parent cavity's footprint)
+      - a wall/gap thinner than MIN_WALL_IN, between sibling cavities in the
+        same layer, or between an island and its parent cavity's wall
+
+    Sibling cavities that are legitimately fully nested inside one another
+    (the existing "stepped pocket" feature) are exempt from the sibling gap
+    check -- there is no side wall between them, only a floor step.
+
+    This is a heuristic guard against known boolean-cut instability with
+    closely-spaced features; it does not fix that instability.
+    """
+    L_mm = layout.block.lengthIn * INCH_TO_MM
+    W_mm = layout.block.widthIn * INCH_TO_MM
+
+    for layer_idx, layer in enumerate(layout.stack):
+        cavities = layer.cavities or []
+        layer_label = layer.label or f"layer[{layer_idx}]"
+
+        footprints: List[dict] = []
+        for cav_idx, cav in enumerate(cavities):
+            fp = _cavity_footprint_mm(cav, L_mm, W_mm)
+            footprints.append(fp)
+
+            for isl_idx, isl in enumerate(cav.islands or []):
+                isl_pts_mm = _normalize_poly_points_mm(isl.points, L_mm, W_mm)
+                if len(isl_pts_mm) < 3:
+                    raise ValueError(
+                        f"{layer_label} cavity[{cav_idx}] island[{isl_idx}] has "
+                        f"fewer than 3 distinct points after normalization"
+                    )
+
+                if not _polygon_fully_inside(isl_pts_mm, fp):
+                    raise ValueError(
+                        f"{layer_label} cavity[{cav_idx}] island[{isl_idx}] is not "
+                        f"fully contained within its parent cavity's footprint"
+                    )
+
+                isl_fp = {"type": "poly", "pts": isl_pts_mm}
+                gap_mm = _min_gap_mm(isl_fp, fp)
+                if gap_mm < MIN_WALL_MM:
+                    gap_in = gap_mm / INCH_TO_MM
+                    raise ValueError(
+                        f"{layer_label} cavity[{cav_idx}] island[{isl_idx}] wall is "
+                        f"{gap_in:.4f}in, thinner than the minimum {MIN_WALL_IN}in guard"
+                    )
+
+        for i in range(len(footprints)):
+            for j in range(i + 1, len(footprints)):
+                fp_a, fp_b = footprints[i], footprints[j]
+                if _footprint_fully_inside(fp_a, fp_b) or _footprint_fully_inside(fp_b, fp_a):
+                    continue  # legitimate nested/stepped pocket -- no side wall
+
+                gap_mm = _min_gap_mm(fp_a, fp_b)
+                if gap_mm < MIN_WALL_MM:
+                    gap_in = gap_mm / INCH_TO_MM
+                    raise ValueError(
+                        f"{layer_label} cavity[{i}] and cavity[{j}] are {gap_in:.4f}in "
+                        f"apart, thinner than the minimum {MIN_WALL_IN}in guard"
+                    )
 
 
 def build_layer_block(
@@ -467,6 +811,46 @@ def build_cad_from_layout(layout: Layout) -> cq.Workplane:
                 cut_result = working.cut(cavity)
                 if cut_result.val().Solids():
                     working = cut_result
+
+                    # ISLAND SUPPORT: cut-then-union-back. Each island is
+                    # extruded from this cavity's own floor (z_cut) back up
+                    # to the layer's original top (z_top) and unioned into
+                    # `working` immediately -- before the loop moves on to
+                    # the next cavity -- so a later sibling cavity can never
+                    # slice into an island before it's restored.
+                    #
+                    # Clamp the island's base to z_bottom: for a THROUGH cut,
+                    # z_cut is intentionally pushed below z_bottom (by
+                    # THROUGH_CUT_EPS_MM) to guarantee a clean exit face on
+                    # the cut. Without this clamp, the island union would
+                    # inherit that same overshoot and leave a sliver of
+                    # material protruding below the layer's actual bottom
+                    # face.
+                    isl_z_base = max(z_cut, z_bottom)
+                    isl_height = z_top - isl_z_base
+
+                    for isl in (cav.islands or []):
+                        try:
+                            if isl_height <= 0:
+                                continue
+
+                            isl_pts_mm = _normalize_poly_points_mm(isl.points, L_mm, W_mm)
+                            if len(isl_pts_mm) < 3:
+                                continue
+
+                            island_solid = (
+                                cq.Workplane("XY")
+                                .workplane(offset=isl_z_base)
+                                .polyline(isl_pts_mm)
+                                .close()
+                                .extrude(isl_height)
+                            )
+
+                            union_result = working.union(island_solid)
+                            if union_result.val().Solids():
+                                working = union_result
+                        except Exception:
+                            continue
 
             except Exception:
                 continue
@@ -1105,6 +1489,11 @@ async def faces_from_stl(file: UploadFile = File(...)):
 
 @app.post("/step-from-layout")
 async def step_from_layout(payload: StepRequest):
+    try:
+        validate_layout(payload.layout)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Layout validation failed: {exc}")
+
     try:
         solid = build_cad_from_layout(payload.layout)
         step_text = export_step_text(solid)
