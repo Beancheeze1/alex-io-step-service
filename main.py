@@ -492,25 +492,32 @@ def _min_gap_mm(fp_a: dict, fp_b: dict) -> float:
     return min(_seg_seg_dist(a1, a2, b1, b2) for a1, a2 in edges_a for b1, b2 in edges_b)
 
 
-def validate_layout(layout: "Layout") -> None:
+def validate_layout(layout: "Layout") -> List[str]:
     """
-    Pre-flight validation, run BEFORE any CAD kernel calls. Raises
-    ValueError (caller maps this to HTTP 400) with a clear, human-readable
-    message for:
-      - a malformed island (fewer than 3 distinct points, or not fully
-        contained within its parent cavity's footprint)
+    Pre-flight validation, run BEFORE any CAD kernel calls.
+
+    Hard blocks (raise ValueError, caller maps this to HTTP 400) -- these
+    are genuinely invalid/malformed data, not a spacing judgment call:
+      - an island with fewer than 3 distinct points after normalization
+      - an island not fully contained within its parent cavity's footprint
+
+    Non-fatal warnings (returned as a list of strings, export proceeds):
       - a wall/gap thinner than MIN_WALL_IN, between sibling cavities in the
-        same layer, or between an island and its parent cavity's wall
+        same layer, or between an island and its parent cavity's wall.
+        This is a heuristic guard against known boolean-cut instability
+        with closely-spaced features, not a correctness issue -- a
+        real-world layout can legitimately need a wall this thin (see
+        Q-AI-20260803-104756), so it's surfaced for a human to weigh
+        rather than blocking export outright.
 
     Sibling cavities that are legitimately fully nested inside one another
     (the existing "stepped pocket" feature) are exempt from the sibling gap
     check -- there is no side wall between them, only a floor step.
-
-    This is a heuristic guard against known boolean-cut instability with
-    closely-spaced features; it does not fix that instability.
     """
     L_mm = layout.block.lengthIn * INCH_TO_MM
     W_mm = layout.block.widthIn * INCH_TO_MM
+
+    warnings: List[str] = []
 
     for layer_idx, layer in enumerate(layout.stack):
         cavities = layer.cavities or []
@@ -539,7 +546,7 @@ def validate_layout(layout: "Layout") -> None:
                 gap_mm = _min_gap_mm(isl_fp, fp)
                 if gap_mm < MIN_WALL_MM:
                     gap_in = gap_mm / INCH_TO_MM
-                    raise ValueError(
+                    warnings.append(
                         f"{layer_label} cavity[{cav_idx}] island[{isl_idx}] wall is "
                         f"{gap_in:.4f}in, thinner than the minimum {MIN_WALL_IN}in guard"
                     )
@@ -553,10 +560,12 @@ def validate_layout(layout: "Layout") -> None:
                 gap_mm = _min_gap_mm(fp_a, fp_b)
                 if gap_mm < MIN_WALL_MM:
                     gap_in = gap_mm / INCH_TO_MM
-                    raise ValueError(
+                    warnings.append(
                         f"{layer_label} cavity[{i}] and cavity[{j}] are {gap_in:.4f}in "
                         f"apart, thinner than the minimum {MIN_WALL_IN}in guard"
                     )
+
+    return warnings
 
 
 def build_layer_block(
@@ -1490,7 +1499,7 @@ async def faces_from_stl(file: UploadFile = File(...)):
 @app.post("/step-from-layout")
 async def step_from_layout(payload: StepRequest):
     try:
-        validate_layout(payload.layout)
+        warnings = validate_layout(payload.layout)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Layout validation failed: {exc}")
 
@@ -1509,6 +1518,7 @@ async def step_from_layout(payload: StepRequest):
         "step": step_text,
         "quoteNo": payload.quoteNo,
         "materialLegend": payload.materialLegend,
+        "warnings": warnings,
     }
 
 
